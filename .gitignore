@@ -1,2 +1,4 @@
 /target
 /dist
+/*.png
+/.playwright-mcp

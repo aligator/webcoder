@@ -1,19 +1,4 @@
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Mode {
-    Mux,
-    Batch,
-}
-
-impl Mode {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Mux => "Muxing",
-            Self::Batch => "Batch",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum StreamKind {
     Video,
     Audio,
@@ -54,7 +39,7 @@ impl StreamKind {
 /// (e.g. `libx264`) taken directly from the bundled WASM core's `-encoders`
 /// list — nothing is hardcoded, so the dropdown always reflects what the
 /// browser build can actually run.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum TrackOutput {
     Copy,
     Strip,
@@ -87,12 +72,11 @@ impl TrackOutput {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum QualityMode {
     ConstantQuality,
     Bitrate,
     FileSize,
-    Vmaf,
 }
 
 impl QualityMode {
@@ -101,46 +85,6 @@ impl QualityMode {
             Self::ConstantQuality => "Constant quality",
             Self::Bitrate => "Target bitrate",
             Self::FileSize => "Target file size",
-            Self::Vmaf => "Target VMAF",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Utility {
-    ReadBitrates,
-    Metrics,
-    TransferColor,
-    ConcatMkv,
-    BitrateChart,
-}
-
-impl Utility {
-    pub const ALL: &'static [Self] = &[
-        Self::ReadBitrates,
-        Self::Metrics,
-        Self::TransferColor,
-        Self::ConcatMkv,
-        Self::BitrateChart,
-    ];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::ReadBitrates => "Read bitrates",
-            Self::Metrics => "Get metrics",
-            Self::TransferColor => "Transfer color metadata",
-            Self::ConcatMkv => "Concatenate into MKV",
-            Self::BitrateChart => "Show bitrate chart",
-        }
-    }
-
-    pub fn description(self) -> &'static str {
-        match self {
-            Self::ReadBitrates => "Estimate per-stream size and average bitrate.",
-            Self::Metrics => "Prepare VMAF, SSIM, and PSNR analysis commands.",
-            Self::TransferColor => "Copy color tags and HDR metadata between files.",
-            Self::ConcatMkv => "Build a concat list and merge compatible files.",
-            Self::BitrateChart => "Export bitrate over time for graphing.",
         }
     }
 }
@@ -153,7 +97,7 @@ pub struct MediaFile {
     pub tracks: Vec<Track>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Track {
     pub id: usize,
     pub source_index: usize,
@@ -165,13 +109,10 @@ pub struct Track {
     pub choice: TrackOutput,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ConvertSettings {
-    pub mode: Mode,
     pub output_name: String,
     pub container: String,
-    pub custom_args_in: String,
-    pub custom_args_out: String,
     pub preset: String,
     pub quality_mode: QualityMode,
     pub quality_value: u32,
@@ -198,17 +139,19 @@ pub struct AppState {
     pub files: Vec<MediaFile>,
     pub selected_file: Option<usize>,
     pub convert: ConvertSettings,
-    pub utility: Utility,
 }
+
+pub const METADATA_COPY: &str = "Copy Input Metadata, Apply Track Titles/Languages";
+pub const METADATA_STRIP_KEEP_TRACKS: &str = "Apply Track Titles/Languages, Strip Other Metadata";
+pub const METADATA_STRIP_ALL: &str = "Strip All Metadata";
+pub const CHAPTERS_COPY: &str = "Copy Chapters From Input";
+pub const CHAPTERS_STRIP: &str = "Strip Chapters";
 
 impl Default for ConvertSettings {
     fn default() -> Self {
         Self {
-            mode: Mode::Mux,
             output_name: "output".into(),
             container: "mkv".into(),
-            custom_args_in: String::new(),
-            custom_args_out: String::new(),
             preset: "medium".into(),
             quality_mode: QualityMode::ConstantQuality,
             quality_value: 24,
@@ -225,8 +168,8 @@ impl Default for ConvertSettings {
             audio_channels: "source".into(),
             audio_bitrate_kbps: 160,
             burn_subtitles: false,
-            metadata_mode: "Copy All From Input, Edit Titles/Languages".into(),
-            chapter_mode: "Copy All From Input, Edit Titles/Languages".into(),
+            metadata_mode: METADATA_COPY.into(),
+            chapter_mode: CHAPTERS_COPY.into(),
             apply_track_metadata: true,
         }
     }
@@ -238,7 +181,6 @@ impl Default for AppState {
             files: Vec::new(),
             selected_file: None,
             convert: ConvertSettings::default(),
-            utility: Utility::ReadBitrates,
         }
     }
 }
@@ -252,43 +194,6 @@ impl AppState {
 
 pub fn command_preview(state: &AppState) -> String {
     build_ffmpeg_command(state)
-}
-
-pub fn utility_command(state: &AppState) -> String {
-    let input = state
-        .selected_file()
-        .map(|file| shell_quote(&file.name))
-        .unwrap_or_else(|| "\"input.mkv\"".into());
-
-    match state.utility {
-        Utility::ReadBitrates => format!(
-            "ffprobe -v error -show_entries stream=index,codec_type,codec_name,bit_rate:format=duration,size -of json {input}"
-        ),
-        Utility::Metrics => format!(
-            "ffmpeg -i {input} -i \"reference.mkv\" -lavfi libvmaf=log_fmt=json:log_path=vmaf.json -f null -"
-        ),
-        Utility::TransferColor => format!(
-            "ffmpeg -i {input} -i \"metadata-source.mkv\" -map 0 -c copy -map_metadata 1 -color_primaries bt2020 -colorspace bt2020nc -color_trc smpte2084 \"color-tagged.mkv\""
-        ),
-        Utility::ConcatMkv => {
-            "printf \"file '%s'\\n\" *.mkv > concat.txt\nffmpeg -f concat -safe 0 -i concat.txt -c copy \"joined.mkv\"".into()
-        }
-        Utility::BitrateChart => format!(
-            "ffprobe -v error -select_streams v:0 -show_entries packet=pts_time,size -of csv=p=0 {input} > bitrate-packets.csv"
-        ),
-    }
-}
-
-pub fn ffmpeg_args(state: &AppState) -> Vec<String> {
-    let Some(file) = state.selected_file() else {
-        return Vec::new();
-    };
-
-    build_ffmpeg_args(state, file, false)
-}
-
-pub fn output_file_name(state: &AppState) -> String {
-    output_name_from_settings(&state.convert)
 }
 
 fn output_name_from_settings(settings: &ConvertSettings) -> String {
@@ -310,35 +215,73 @@ fn build_ffmpeg_command(state: &AppState) -> String {
 }
 
 fn build_ffmpeg_args(state: &AppState, file: &MediaFile, quoted: bool) -> Vec<String> {
+    let output = output_name_from_settings(&state.convert);
+    build_args(&state.convert, &file.tracks, &file.name, &output, quoted)
+}
+
+/// Build the FFmpeg argument vector (everything after the `ffmpeg` program name)
+/// from structured settings only. `input`/`output` are supplied explicitly so
+/// the server can pin them to sandboxed paths it controls rather than trusting
+/// any client-provided path. There is deliberately no free-form custom-args
+/// escape hatch: the whole command is derived from validated fields.
+pub fn build_args(
+    settings: &ConvertSettings,
+    tracks: &[Track],
+    input: &str,
+    output: &str,
+    quoted: bool,
+) -> Vec<String> {
     let mut args = vec!["-hide_banner".to_owned(), "-y".to_owned()];
 
-    extend_shell_words(&mut args, &state.convert.custom_args_in);
-    args.extend(["-i".to_owned(), path_arg(&file.name, quoted)]);
+    args.extend(["-i".to_owned(), path_arg(input, quoted)]);
 
-    for track in file.tracks.iter().filter(|track| track.enabled) {
+    let write_track_metadata =
+        settings.apply_track_metadata && settings.metadata_mode != METADATA_STRIP_ALL;
+    for track in tracks.iter().filter(|track| track.enabled) {
         if track.choice != TrackOutput::Strip {
             args.push("-map".into());
             args.push(format!("0:{}?", track.source_index));
         }
     }
 
-    for track in file.tracks.iter().filter(|track| track.enabled) {
+    // Some bundled encoders are flagged experimental by the WASM core (e.g. the
+    // native `opus`/`vorbis` encoders). FFmpeg refuses them unless `-strict`
+    // is relaxed, so enable it when such an encoder is selected.
+    let needs_experimental = tracks
+        .iter()
+        .filter(|track| track.enabled)
+        .any(|track| matches!(track.choice.ffmpeg_codec(), Some("opus" | "vorbis")));
+    if needs_experimental {
+        args.push("-strict".into());
+        args.push("experimental".into());
+    }
+
+    let mut output_index = 0usize;
+    let mut per_type_index: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
+    for track in tracks.iter().filter(|track| track.enabled) {
         if track.choice == TrackOutput::Strip {
             continue;
         }
 
-        let stream_id = track.id.saturating_sub(1);
+        // Absolute output stream index for `-metadata:s:N`, and a per-kind index
+        // for `-c:<type>:N` — the two use different numbering schemes.
+        let stream_id = output_index;
+        output_index += 1;
+        let prefix = track.kind.ffmpeg_prefix();
+        let type_index = per_type_index.entry(prefix).or_insert(0);
         if let Some(codec) = track.choice.ffmpeg_codec() {
-            args.push(format!("-c:{}:{stream_id}", track.kind.ffmpeg_prefix()));
+            args.push(format!("-c:{prefix}:{type_index}"));
             args.push(codec.into());
         }
+        *type_index += 1;
 
-        if !track.language.trim().is_empty() {
+        if write_track_metadata && !track.language.trim().is_empty() {
             args.push(format!("-metadata:s:{stream_id}"));
             args.push(format!("language={}", track.language.trim()));
         }
 
-        if state.convert.apply_track_metadata && !track.title.trim().is_empty() {
+        if write_track_metadata && !track.title.trim().is_empty() {
             args.push(format!("-metadata:s:{stream_id}"));
             args.push(if quoted {
                 shell_quote(&format!("title={}", track.title.trim()))
@@ -348,18 +291,12 @@ fn build_ffmpeg_args(state: &AppState, file: &MediaFile, quoted: bool) -> Vec<St
         }
     }
 
-    append_quality_args(&mut args, &state.convert);
-    append_video_filter_args(&mut args, &state.convert);
-    append_audio_args(&mut args, &state.convert);
+    append_quality_args(&mut args, settings);
+    append_video_filter_args(&mut args, settings, input, quoted);
+    append_audio_args(&mut args, settings);
 
-    if state.convert.burn_subtitles {
-        args.push("-vf".into());
-        args.push(format!("subtitles={}", path_arg(&file.name, quoted)));
-    }
-
-    append_metadata_args(&mut args, &state.convert);
-    extend_shell_words(&mut args, &state.convert.custom_args_out);
-    args.push(path_arg(&output_name_from_settings(&state.convert), quoted));
+    append_metadata_args(&mut args, settings);
+    args.push(path_arg(output, quoted));
     args
 }
 
@@ -379,14 +316,15 @@ fn append_quality_args(args: &mut Vec<String>, settings: &ConvertSettings) {
             args.push("-fs".into());
             args.push(format!("{}M", settings.target_size_mb));
         }
-        QualityMode::Vmaf => {
-            args.push("-crf".into());
-            args.push(settings.quality_value.to_string());
-        }
     }
 }
 
-fn append_video_filter_args(args: &mut Vec<String>, settings: &ConvertSettings) {
+fn append_video_filter_args(
+    args: &mut Vec<String>,
+    settings: &ConvertSettings,
+    input: &str,
+    quoted: bool,
+) {
     let mut filters = Vec::new();
 
     if !settings.trim_start.trim().is_empty() {
@@ -410,10 +348,12 @@ fn append_video_filter_args(args: &mut Vec<String>, settings: &ConvertSettings) 
         filters.push(format!("scale={}", settings.resize.trim()));
     }
 
-    if settings.crop_mode == "Automatic" {
-        filters.push("cropdetect".into());
-    } else if settings.crop_mode == "Manual" && !settings.crop.trim().is_empty() {
+    if settings.crop_mode == "Manual" && !settings.crop.trim().is_empty() {
         filters.push(format!("crop={}", settings.crop.trim()));
+    }
+
+    if settings.burn_subtitles {
+        filters.push(format!("subtitles={}", path_arg(input, quoted)));
     }
 
     if !filters.is_empty() {
@@ -440,24 +380,18 @@ fn append_audio_args(args: &mut Vec<String>, settings: &ConvertSettings) {
 }
 
 fn append_metadata_args(args: &mut Vec<String>, settings: &ConvertSettings) {
-    if settings.metadata_mode == "Apply Titles/Languages, Strip Rest" {
+    if settings.metadata_mode == METADATA_STRIP_KEEP_TRACKS {
         args.push("-map_metadata".into());
         args.push("-1".into());
-    } else if settings.metadata_mode == "Strip All Metadata Including Titles/Languages" {
+    } else if settings.metadata_mode == METADATA_STRIP_ALL {
         args.push("-map_metadata".into());
-        args.push("-1".into());
-        args.push("-map_chapters".into());
         args.push("-1".into());
     }
 
-    if settings.chapter_mode == "Strip All Metadata Including Titles/Languages" {
+    if settings.chapter_mode == CHAPTERS_STRIP {
         args.push("-map_chapters".into());
         args.push("-1".into());
     }
-}
-
-fn extend_shell_words(args: &mut Vec<String>, value: &str) {
-    args.extend(value.split_whitespace().map(ToOwned::to_owned));
 }
 
 fn path_arg(path: &str, quoted: bool) -> String {
@@ -466,6 +400,148 @@ fn path_arg(path: &str, quoted: bool) -> String {
     } else {
         path.to_owned()
     }
+}
+
+/// Output containers the server is willing to mux into. Anything else is
+/// rejected before an FFmpeg process is ever spawned.
+pub const ALLOWED_CONTAINERS: &[&str] = &["mkv", "mp4", "mov", "webm", "gif"];
+const ALLOWED_PRESETS: &[&str] = &["ultrafast", "veryfast", "fast", "medium", "slow", "slower"];
+const ALLOWED_PIXEL_FORMATS: &[&str] = &["source", "yuv420p", "yuv420p10le", "yuv444p", "rgb24"];
+const ALLOWED_CROP_MODES: &[&str] = &["Disable", "Manual"];
+const ALLOWED_AUDIO_CHANNELS: &[&str] = &["source", "1", "2", "6", "8"];
+const ALLOWED_METADATA_MODES: &[&str] = &[
+    METADATA_COPY,
+    METADATA_STRIP_KEEP_TRACKS,
+    METADATA_STRIP_ALL,
+];
+const ALLOWED_CHAPTER_MODES: &[&str] = &[CHAPTERS_COPY, CHAPTERS_STRIP];
+
+/// Reduce an arbitrary user string to a safe file stem: ASCII alphanumerics,
+/// dash, underscore and dot only, never empty, length-capped. Used so the
+/// client can never influence the on-disk path (traversal, absolute paths,
+/// option-injection via a leading dash, etc.).
+pub fn safe_stem(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(80)
+        .collect();
+    let trimmed = cleaned.trim_matches(['.', '-', '_', ' ']).to_owned();
+    if trimmed.is_empty() {
+        "output".to_owned()
+    } else {
+        trimmed
+    }
+}
+
+fn token_ok(value: &str, extra: &str) -> bool {
+    !value.starts_with('-')
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || extra.contains(c))
+}
+
+/// Validate a decode/encode job built from client-supplied settings against the
+/// set of encoder names the local FFmpeg actually offers. Returns a
+/// human-readable reason on the first problem. This is the security gate: every
+/// value that ends up on the FFmpeg command line is checked here, and there is
+/// no path for free-form arguments to reach the process.
+pub fn validate_job(
+    settings: &ConvertSettings,
+    tracks: &[Track],
+    stream_count: usize,
+    encoders: &std::collections::HashSet<String>,
+) -> Result<(), String> {
+    if !ALLOWED_CONTAINERS.contains(&settings.container.as_str()) {
+        return Err(format!("Unsupported container: {}", settings.container));
+    }
+    if settings.output_name.trim().is_empty() {
+        return Err("Output name is empty.".into());
+    }
+    if !ALLOWED_PRESETS.contains(&settings.preset.as_str()) {
+        return Err("Unsupported preset value.".into());
+    }
+    if !ALLOWED_PIXEL_FORMATS.contains(&settings.color_format.as_str()) {
+        return Err("Unsupported pixel format value.".into());
+    }
+    if !ALLOWED_CROP_MODES.contains(&settings.crop_mode.as_str()) {
+        return Err("Unsupported crop mode.".into());
+    }
+    if !ALLOWED_METADATA_MODES.contains(&settings.metadata_mode.as_str()) {
+        return Err("Unsupported metadata mode.".into());
+    }
+    if !ALLOWED_CHAPTER_MODES.contains(&settings.chapter_mode.as_str()) {
+        return Err("Unsupported chapter mode.".into());
+    }
+    if !(1..=63).contains(&settings.quality_value) {
+        return Err("CRF / CQ value must be between 1 and 63.".into());
+    }
+    if !(64..=250_000).contains(&settings.bitrate_kbps) {
+        return Err("Video bitrate must be between 64 and 250000 kbps.".into());
+    }
+    if !(1..=500_000).contains(&settings.target_size_mb) {
+        return Err("Target size must be between 1 and 500000 MB.".into());
+    }
+    if settings.audio_bitrate_kbps > 6_400 {
+        return Err("Audio bitrate must be between 0 and 6400 kbps.".into());
+    }
+    if !settings.fps.trim().is_empty() && !token_ok(settings.fps.trim(), "./") {
+        return Err("Invalid fps value.".into());
+    }
+    for (label, value) in [("resize", &settings.resize), ("crop", &settings.crop)] {
+        let value = value.trim();
+        if !value.is_empty() && !token_ok(value, "x:.,-") {
+            return Err(format!("Invalid {label} value."));
+        }
+    }
+    for (label, value) in [
+        ("trim start", &settings.trim_start),
+        ("trim end", &settings.trim_end),
+        ("trim duration", &settings.trim_duration),
+    ] {
+        let value = value.trim();
+        if !value.is_empty() && !token_ok(value, ":.") {
+            return Err(format!("Invalid {label} value."));
+        }
+    }
+    if !ALLOWED_AUDIO_CHANNELS.contains(&settings.audio_channels.as_str()) {
+        return Err("Unsupported audio channel value.".into());
+    }
+
+    let mut enabled = 0usize;
+    for track in tracks.iter().filter(|track| track.enabled) {
+        enabled += 1;
+        if track.source_index >= stream_count {
+            return Err(format!(
+                "Track references stream {} but the input has {stream_count} streams.",
+                track.source_index
+            ));
+        }
+        if let TrackOutput::Encoder(name) = &track.choice {
+            if !token_ok(name, "-_.") {
+                return Err(format!("Invalid encoder name: {name}"));
+            }
+            if !encoders.contains(name) {
+                return Err(format!("Encoder not available on server: {name}"));
+            }
+        }
+        if track.language.chars().any(|c| c.is_control()) {
+            return Err("Track language contains invalid characters.".into());
+        }
+        if track.title.chars().any(|c| c.is_control()) {
+            return Err("Track title contains invalid characters.".into());
+        }
+    }
+    if enabled == 0 {
+        return Err("No enabled tracks to encode.".into());
+    }
+    Ok(())
 }
 
 pub fn format_size(bytes: u64) -> String {
@@ -545,21 +621,66 @@ mod tests {
         assert!(command.contains("-map 0:0?"));
         assert!(command.contains("-map 0:1?"));
         assert!(command.contains("-c:v:0 libsvtav1"));
-        assert!(command.contains("-c:a:1 libopus"));
-    }
-
-    #[test]
-    fn utility_commands_use_selected_input() {
-        let mut state = media_state();
-        state.utility = Utility::BitrateChart;
-
-        assert!(utility_command(&state).contains("source.mkv"));
-        assert!(utility_command(&state).contains("bitrate-packets.csv"));
+        assert!(command.contains("-c:a:0 libopus"));
     }
 
     #[test]
     fn shell_quote_escapes_spaces() {
         assert_eq!(shell_quote("clip one.mkv"), "\"clip one.mkv\"");
         assert_eq!(shell_quote("clip.mkv"), "clip.mkv");
+    }
+
+    #[test]
+    fn subtitle_burn_shares_video_filter_chain() {
+        let mut state = media_state();
+        state.convert.fps = "24".into();
+        state.convert.resize = "1280:-2".into();
+        state.convert.crop_mode = "Manual".into();
+        state.convert.crop = "1280:720:0:0".into();
+        state.convert.burn_subtitles = true;
+
+        let args = build_ffmpeg_args(&state, state.selected_file().unwrap(), false);
+        let filter_count = args.iter().filter(|arg| *arg == "-vf").count();
+        assert_eq!(filter_count, 1);
+        let filter = args
+            .windows(2)
+            .find_map(|pair| (pair[0] == "-vf").then_some(pair[1].as_str()))
+            .unwrap();
+        assert!(filter.contains("fps=24"));
+        assert!(filter.contains("scale=1280:-2"));
+        assert!(filter.contains("crop=1280:720:0:0"));
+        assert!(filter.contains("subtitles=source.mkv"));
+    }
+
+    #[test]
+    fn strip_all_metadata_keeps_chapter_choice_separate() {
+        let mut state = media_state();
+        state.convert.metadata_mode = METADATA_STRIP_ALL.into();
+        state.convert.chapter_mode = CHAPTERS_COPY.into();
+
+        let args = build_ffmpeg_args(&state, state.selected_file().unwrap(), false);
+        assert!(args.windows(2).any(|pair| pair == ["-map_metadata", "-1"]));
+        assert!(!args.windows(2).any(|pair| pair == ["-map_chapters", "-1"]));
+        assert!(!args.iter().any(|arg| arg.starts_with("language=")));
+        assert!(!args.iter().any(|arg| arg.starts_with("title=")));
+    }
+
+    #[test]
+    fn validation_rejects_unknown_convert_options() {
+        let mut state = media_state();
+        state.convert.crop_mode = "Automatic".into();
+        let encoders = ["libsvtav1", "libopus", "srt"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+
+        let error = validate_job(
+            &state.convert,
+            &state.selected_file().unwrap().tracks,
+            3,
+            &encoders,
+        )
+        .unwrap_err();
+        assert_eq!(error, "Unsupported crop mode.");
     }
 }

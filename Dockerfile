@@ -1,23 +1,19 @@
 # syntax=docker/dockerfile:1
 
 ########################################
-# Stage 1 — build the WASM bundle
+# Stage 1 — build the WASM frontend + native server
 ########################################
-FROM --platform=$BUILDPLATFORM rust:1.95-bookworm AS builder
+# Build for the target platform so the native `server` binary matches the
+# runtime architecture. (The WASM bundle is arch-independent.)
+FROM --platform=$TARGETPLATFORM rust:1.95-bookworm AS builder
 
-# Pin trunk for reproducibility. Trunk auto-downloads the matching
-# wasm-bindgen-cli at build time, so we don't install it separately.
 ARG TRUNK_VERSION=0.21.14
+ARG TARGETARCH
 
-# Provided by BuildKit; arch of the build host (matches BUILDPLATFORM above).
-ARG BUILDARCH
-
-# wasm target + trunk (prebuilt binary; avoids compiling trunk from source).
-# Pick the trunk asset matching the build host architecture.
-RUN case "${BUILDARCH}" in \
+RUN case "${TARGETARCH}" in \
       amd64) TRUNK_ARCH=x86_64 ;; \
       arm64) TRUNK_ARCH=aarch64 ;; \
-      *) echo "unsupported arch: ${BUILDARCH}" >&2; exit 1 ;; \
+      *) echo "unsupported arch: ${TARGETARCH}" >&2; exit 1 ;; \
     esac \
  && rustup target add wasm32-unknown-unknown \
  && curl -fsSL "https://github.com/trunk-rs/trunk/releases/download/v${TRUNK_VERSION}/trunk-${TRUNK_ARCH}-unknown-linux-gnu.tar.gz" \
@@ -25,38 +21,51 @@ RUN case "${BUILDARCH}" in \
 
 WORKDIR /app
 
-# Cache dependency compilation: copy manifests, fetch, then copy sources.
+# Cache dependency compilation.
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir -p src && echo 'fn main() {}' > src/main.rs \
- && cargo fetch --target wasm32-unknown-unknown \
+RUN mkdir -p src src/bin \
+ && echo 'fn main() {}' > src/main.rs \
+ && echo 'fn main() {}' > src/bin/server.rs \
+ && echo 'pub mod placeholder {}' > src/lib.rs \
+ && cargo fetch \
  && rm -rf src
 
-# Real sources + web assets.
 COPY . .
 
-# Trunk reads index.html; outputs to dist/.
-RUN trunk build --release --dist dist
+# Frontend bundle (WASM) and the release server binary.
+RUN trunk build --release --dist dist \
+ && cargo build --release --bin server
 
 ########################################
-# Stage 2 — serve static bundle
+# Stage 2 — runtime: system FFmpeg + server
 ########################################
-FROM nginx:1.27-alpine AS runtime
+FROM debian:bookworm-slim AS runtime
 
-# Non-root: nginx:alpine already ships an unprivileged setup on :8080 via
-# the templated default, but we bring our own conf and run as the nginx user.
-RUN rm -f /etc/nginx/conf.d/default.conf
+# ffmpeg brings full native codec support (AV1 decode via libdav1d, etc.).
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ffmpeg ca-certificates wget \
+ && rm -rf /var/lib/apt/lists/*
 
-COPY nginx.conf /etc/nginx/nginx.conf
-COPY --from=builder /app/dist /usr/share/nginx/html
+# Unprivileged runtime user; work/temp dirs it can write.
+RUN useradd --system --create-home --uid 10001 webcoder \
+ && mkdir -p /app/work \
+ && chown -R webcoder:webcoder /app
 
-# Drop privileges: 8080 is unprivileged, temp/pid paths live under /tmp.
-USER nginx
+WORKDIR /app
+COPY --from=builder /app/dist /app/dist
+COPY --from=builder /app/target/release/server /usr/local/bin/webcoder-server
+
+USER webcoder
+
+ENV WEBCODER_ADDR=0.0.0.0:8080 \
+    WEBCODER_DIST=/app/dist \
+    WEBCODER_WORKDIR=/app/work
 
 EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
   CMD wget -q -O /dev/null http://127.0.0.1:8080/ || exit 1
 
-STOPSIGNAL SIGQUIT
+STOPSIGNAL SIGTERM
 
-CMD ["nginx", "-g", "daemon off;"]
+CMD ["webcoder-server"]

@@ -21,8 +21,9 @@
 
 html,
 body {
-  min-height: 100%;
+  height: 100%;
   margin: 0;
+  overflow: hidden; /* lock the page; only inner panes scroll */
   background: var(--bg);
   color: var(--ink);
 }
@@ -56,13 +57,15 @@ button {
 }
 
 .app-shell {
-  min-height: 100vh;
+  height: 100vh;
+  overflow: hidden;
   display: grid;
   grid-template-columns: 236px minmax(0, 1fr);
 }
 
 .side-rail {
   min-height: 100vh;
+  overflow-y: auto;
   padding: 18px 14px;
   background: #192126;
   color: #eef7f5;
@@ -80,7 +83,8 @@ button {
 
 .brand-mark,
 .file-token,
-.panel-title span,
+.panel-title > .material-symbols-rounded,
+.panel-title-label > .material-symbols-rounded,
 .drop-zone label span {
   width: 42px;
   height: 42px;
@@ -104,7 +108,6 @@ button {
 .file-row small,
 .topbar p,
 label span,
-.utility-card span,
 .copy-state {
   color: var(--muted);
 }
@@ -170,7 +173,14 @@ label span,
 
 .workspace {
   min-width: 0;
+  min-height: 0;
+  height: 100vh;
+  box-sizing: border-box;
   padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  overflow: hidden;
 }
 
 .topbar {
@@ -193,16 +203,6 @@ label span,
   margin: 8px 0 0;
 }
 
-.mode-switch {
-  display: inline-grid;
-  grid-auto-flow: column;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  overflow: hidden;
-  background: var(--surface);
-  flex: 0 0 auto;
-}
-
 .topbar-actions {
   display: flex;
   align-items: center;
@@ -210,33 +210,97 @@ label span,
   flex: 0 0 auto;
 }
 
-.segmented-button {
-  min-width: 94px;
-  min-height: 40px;
-  border: 0;
-  border-right: 1px solid var(--line);
-  background: transparent;
-  color: var(--ink);
-}
-
-.segmented-button:last-child {
-  border-right: 0;
-}
-
-.segmented-button.active {
-  background: var(--accent);
-  color: white;
-}
-
 .content-grid {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(320px, 430px);
   gap: 16px;
-  align-items: start;
+  align-items: stretch;
+  flex: 1 1 auto;
+  min-height: 0;
 }
 
 .content-grid.preview-hidden {
   grid-template-columns: minmax(0, 1fr);
+}
+
+/* Media page: track selector on the left, uploaded-files panel on the right.
+   Each column scrolls independently; the page itself never scrolls. */
+.media-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(260px, 320px);
+  gap: 16px;
+  align-items: stretch;
+  height: 100%;
+  min-height: 0;
+}
+
+.media-main {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+}
+
+/* Tracks column: header + default-track selectors stay put, the track table
+   scrolls, the stream-details box is pinned at the bottom. */
+.media-main > .stack {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.media-main > .empty-panel {
+  flex: 1 1 auto;
+}
+
+.media-main .section-head,
+.media-main .default-track-row {
+  flex: 0 0 auto;
+}
+
+.media-main .track-table {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+}
+
+.media-main .stream-details {
+  flex: 0 0 auto;
+  height: 116px;
+}
+
+/* Files column: drop zone + toolbar fixed, the file list scrolls. */
+.media-files {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+  min-height: 0;
+}
+
+.media-files .drop-zone,
+.media-files .file-toolbar {
+  flex: 0 0 auto;
+}
+
+.media-files .drop-zone {
+  min-height: 150px;
+}
+
+.media-files .file-list {
+  border: 0;
+  box-shadow: none;
+  background: transparent;
+  padding: 0;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+@media (max-width: 900px) {
+  .media-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 .primary-pane,
@@ -254,13 +318,14 @@ label span,
 
 .primary-pane,
 .preview-pane {
-  min-height: calc(100vh - 132px);
+  min-height: 0;
+  height: 100%;
+  box-sizing: border-box;
+  overflow-y: auto;
   padding: 16px;
 }
 
 .preview-pane {
-  position: sticky;
-  top: 20px;
   display: grid;
   gap: 12px;
   align-content: start;
@@ -307,6 +372,8 @@ label span,
 .file-list {
   display: grid;
   gap: 10px;
+  align-content: start;
+  grid-auto-rows: min-content;
 }
 
 .file-toolbar {
@@ -375,6 +442,13 @@ label span,
   min-width: 0;
 }
 
+.panel-title-label {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
 .section-head h2,
 .panel-title h2 {
   margin: 0;
@@ -391,7 +465,9 @@ label span,
 .track-table {
   display: grid;
   gap: 6px;
-  overflow-x: auto;
+  overflow: auto;
+  align-content: start;
+  grid-auto-rows: min-content;
 }
 
 .track-head,
@@ -423,6 +499,15 @@ label span,
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 4px;
+}
+
+/* Probed, read-only facts (stream type + codec) — not editable inputs. */
+.track-fact {
+  font-size: 0.85rem;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .settings-grid {
@@ -508,34 +593,6 @@ button:focus-visible {
   align-items: center;
 }
 
-.utility-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
-  gap: 10px;
-}
-
-.utility-card {
-  min-height: 112px;
-  text-align: left;
-  padding: 14px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--surface);
-  display: grid;
-  gap: 8px;
-  align-content: start;
-}
-
-.utility-card.active {
-  border-color: var(--accent);
-  background: #effaf7;
-}
-
-.utility-card strong,
-.utility-card span {
-  overflow-wrap: anywhere;
-}
-
 .queue-board {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -545,19 +602,24 @@ button:focus-visible {
 }
 
 .queue-metric {
-  min-height: 112px;
+  min-height: 76px;
   display: grid;
   align-content: center;
   justify-items: center;
+  gap: 2px;
   background: #fbfcfc;
-  padding: 12px;
+  padding: 10px;
   text-align: center;
 }
 
 .queue-metric span {
-  font-size: clamp(1.4rem, 2vw, 2.2rem);
+  font-size: clamp(1.1rem, 1.4vw, 1.5rem);
   font-weight: 800;
   overflow-wrap: anywhere;
+}
+
+.queue-metric small {
+  font-size: 0.75rem;
 }
 
 .command-box {
@@ -571,12 +633,147 @@ button:focus-visible {
   border-color: #10181c;
 }
 
-.command-box.tall {
-  min-height: 260px;
-}
 
 .command-box.log {
   min-height: 120px;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.log-block {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+/* Queue view: fill the pane so the log grows to take the rest of the page. */
+.queue-stack {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.queue-stack .runtime-panel {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+}
+
+/* Batch results: a scrollable list of compact status cards. */
+.results-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-right: 4px;
+}
+
+.result-card {
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: #fbfcfc;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.result-card.is-done {
+  border-left-color: var(--accent);
+}
+
+.result-card.is-failed {
+  border-left-color: #c0392b;
+}
+
+.result-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.result-head strong {
+  overflow-wrap: anywhere;
+}
+
+.result-badge {
+  font-size: 20px;
+}
+
+.is-done .result-badge {
+  color: var(--accent);
+}
+
+.is-failed .result-badge {
+  color: #c0392b;
+}
+
+.is-running .result-badge {
+  color: var(--muted);
+}
+
+.result-status {
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+a.result-download {
+  margin-left: auto;
+  min-height: 36px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 14px;
+  font-size: 0.85rem;
+  white-space: nowrap;
+  text-decoration: none;
+}
+
+a.result-download .material-symbols-rounded {
+  font-size: 18px;
+}
+
+.result-log summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 0.82rem;
+  user-select: none;
+}
+
+.result-log .command-box.log {
+  margin-top: 8px;
+  min-height: 200px;
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+}
+
+.result-empty {
+  color: var(--muted);
+  padding: 12px 0;
+}
+
+.runtime-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.log-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 0.8rem;
+  color: var(--muted);
 }
 
 .preview-actions {
@@ -703,18 +900,10 @@ button:focus-visible {
     display: grid;
   }
 
-  .topbar-actions,
-  .mode-switch {
-    width: 100%;
-  }
-
   .topbar-actions {
+    width: 100%;
     align-items: stretch;
-    justify-content: space-between;
-  }
-
-  .topbar-actions .mode-switch {
-    flex: 1 1 auto;
+    justify-content: flex-end;
   }
 
   .topbar-actions .icon-button {

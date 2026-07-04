@@ -1,8 +1,9 @@
 use crate::core::{
-    AppState, ConvertSettings, MediaFile, Mode, QualityMode, StreamKind, Track, TrackOutput,
-    Utility, command_preview, ffmpeg_args, format_size, output_file_name, utility_command,
+    AppState, CHAPTERS_COPY, CHAPTERS_STRIP, ConvertSettings, METADATA_COPY, METADATA_STRIP_ALL,
+    METADATA_STRIP_KEEP_TRACKS, MediaFile, QualityMode, StreamKind, Track, TrackOutput,
+    command_preview, format_size,
 };
-use js_sys::{Array, Reflect};
+use serde::Deserialize;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -13,45 +14,99 @@ use web_sys::{Event, File, HtmlInputElement, HtmlSelectElement, InputEvent};
 use yew::TargetCast;
 use yew::prelude::*;
 
-#[wasm_bindgen(module = "/assets/ffmpeg_bridge.js")]
+#[wasm_bindgen(module = "/assets/api.js")]
 extern "C" {
+    #[wasm_bindgen(catch, js_name = getEncoders)]
+    async fn get_encoders() -> Result<JsValue, JsValue>;
+
     #[wasm_bindgen(catch, js_name = probeMedia)]
-    async fn probe_media(file: File, input_name: String) -> Result<JsValue, JsValue>;
+    async fn probe_media(file: File) -> Result<JsValue, JsValue>;
 
-    #[wasm_bindgen(catch, js_name = runFfmpeg)]
-    async fn run_ffmpeg(
-        file: File,
-        input_name: String,
-        output_name: String,
-        args: JsValue,
+    #[wasm_bindgen(catch, js_name = runEncode)]
+    async fn run_encode(
+        job_id: String,
+        settings_json: String,
+        tracks_json: String,
     ) -> Result<JsValue, JsValue>;
+}
 
-    #[wasm_bindgen(catch, js_name = getFfmpegCapabilities)]
-    async fn get_ffmpeg_capabilities() -> Result<JsValue, JsValue>;
+#[derive(Deserialize)]
+struct ApiEncoder {
+    name: String,
+    kind: String,
+    description: String,
+}
+
+#[derive(Deserialize)]
+struct ProbeResponse {
+    job_id: String,
+    #[allow(dead_code)]
+    stream_count: usize,
+    tracks: Vec<Track>,
+}
+
+#[derive(Deserialize)]
+struct EncodeResponse {
+    ok: bool,
+    log: String,
+    output_name: String,
+    download_url: String,
+}
+
+#[derive(Clone, PartialEq)]
+enum EncodeStatus {
+    Running,
+    Done,
+    Failed,
+}
+
+/// One row in the batch queue: the state of encoding a single input file.
+#[derive(Clone, PartialEq)]
+struct EncodeItem {
+    name: String,
+    job_id: String,
+    status: EncodeStatus,
+    log: String,
+    download_url: String,
+    output_name: String,
+}
+
+/// Decode a JSON string returned by the api.js bridge into `T`.
+fn parse_json<T: for<'de> Deserialize<'de>>(value: JsValue) -> Result<T, String> {
+    let text = value
+        .as_string()
+        .ok_or("Expected a JSON string from bridge.")?;
+    serde_json::from_str(&text).map_err(|e| format!("Bad response: {e}"))
+}
+
+fn js_error_text(error: JsValue) -> String {
+    error
+        .as_string()
+        .or_else(|| {
+            js_sys::Reflect::get(&error, &JsValue::from_str("message"))
+                .ok()
+                .and_then(|m| m.as_string())
+        })
+        .unwrap_or_else(|| "unknown error".into())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Tab {
-    Input,
-    Tracks,
+    Media,
     Convert,
-    Utilities,
     Queue,
 }
 
 impl Tab {
     const ALL: &'static [(Self, &'static str, &'static str)] = &[
-        (Self::Input, "input", "Input"),
-        (Self::Tracks, "checklist", "Tracks"),
+        (Self::Media, "video_library", "Media"),
         (Self::Convert, "tune", "Convert"),
-        (Self::Utilities, "construction", "Utilities"),
         (Self::Queue, "queue", "Queue"),
     ];
 }
 
-/// One encoder exposed by the bundled FFmpeg WASM core, parsed from
-/// `ffmpeg -encoders`. Drives the per-track output dropdown so it lists only
-/// codecs the browser build can actually run.
+/// One encoder offered by the server's FFmpeg, from `ffmpeg -encoders`. Drives
+/// the per-track output dropdown so it lists only codecs the backend can run.
 #[derive(Clone, Debug, PartialEq)]
 struct BrowserEncoder {
     name: String,
@@ -59,37 +114,51 @@ struct BrowserEncoder {
     description: String,
 }
 
+fn kind_from_str(value: &str) -> StreamKind {
+    match value {
+        "Video" => StreamKind::Video,
+        "Audio" => StreamKind::Audio,
+        "Subtitle" => StreamKind::Subtitle,
+        _ => StreamKind::Attachment,
+    }
+}
+
 #[function_component(App)]
 pub fn app() -> Html {
     let state = use_state(AppState::default);
-    let tab = use_state(|| Tab::Input);
+    let tab = use_state(|| Tab::Media);
     let copied = use_state(|| false);
     let show_command_preview = use_state(|| false);
-    let job_log = use_state(|| "Browser FFmpeg runtime idle.".to_owned());
+    let job_log = use_state(|| "Server FFmpeg runtime idle.".to_owned());
     let browser_encoders = use_state(Vec::<BrowserEncoder>::new);
-    let browser_capability_status =
-        use_state(|| "Detecting bundled FFmpeg WASM encoders...".to_owned());
-    let output_url = use_state(String::new);
-    let output_name = use_state(String::new);
-    let browser_files = use_mut_ref(HashMap::<usize, File>::new);
+    // Per-input encode results for the batch run.
+    let results = use_state(Vec::<EncodeItem>::new);
+    // Maps a local file id to the server-side job id returned by the probe
+    // upload, so the encode request can reference the already-uploaded input.
+    let job_ids = use_mut_ref(HashMap::<usize, String>::new);
 
-    // Probe the bundled FFmpeg WASM core once on load so every output dropdown
-    // is populated with the encoders the browser can really run.
+    // Fetch the encoders the server's FFmpeg supports once on load so every
+    // output dropdown lists only codecs the backend can actually run.
     {
         let browser_encoders = browser_encoders.clone();
-        let browser_capability_status = browser_capability_status.clone();
+        let job_log = job_log.clone();
         use_effect_with((), move |_| {
             spawn_local(async move {
-                match fetch_browser_encoders().await {
-                    Ok((encoders, _log)) => {
-                        browser_capability_status.set(browser_codec_summary(&encoders));
-                        browser_encoders.set(encoders);
-                    }
+                match get_encoders().await {
+                    Ok(value) => match parse_json::<Vec<ApiEncoder>>(value) {
+                        Ok(list) => browser_encoders.set(
+                            list.into_iter()
+                                .map(|e| BrowserEncoder {
+                                    kind: kind_from_str(&e.kind),
+                                    name: e.name,
+                                    description: e.description,
+                                })
+                                .collect(),
+                        ),
+                        Err(error) => job_log.set(format!("Encoder list error: {error}")),
+                    },
                     Err(error) => {
-                        browser_capability_status.set(format!(
-                            "Browser capability check failed: {}",
-                            js_error_text(error)
-                        ));
+                        job_log.set(format!("Encoder list failed: {}", js_error_text(error)))
                     }
                 }
             });
@@ -98,7 +167,6 @@ pub fn app() -> Html {
     }
 
     let active_command = command_preview(&state);
-    let utility = utility_command(&state);
 
     let on_copy = {
         let active_command = active_command.clone();
@@ -154,10 +222,6 @@ pub fn app() -> Html {
                         <p>{page_subtitle(*tab)}</p>
                     </div>
                     <div class="topbar-actions">
-                        <div class="mode-switch">
-                            { mode_button(&state, Mode::Mux) }
-                            { mode_button(&state, Mode::Batch) }
-                        </div>
                         <button
                             class={classes!("icon-button", "subtle", "material-symbols-rounded", (*show_command_preview).then_some("active"))}
                             title={if *show_command_preview { "Hide command preview" } else { "Show command preview" }}
@@ -171,21 +235,12 @@ pub fn app() -> Html {
                 <section class={classes!("content-grid", (!*show_command_preview).then_some("preview-hidden"))}>
                     <div class="primary-pane">
                         { match *tab {
-                            Tab::Input => view_input(&state, &browser_files, &job_log),
-                            Tab::Tracks => view_tracks(&state, &browser_encoders),
+                            Tab::Media => view_media(&state, &job_ids, &job_log, &browser_encoders),
                             Tab::Convert => view_convert(&state),
-                            Tab::Utilities => view_utilities(&state, &utility),
                             Tab::Queue => view_queue(
                                 &state,
-                                &browser_files,
-                                &active_command,
-                                &on_copy,
-                                *copied,
-                                &job_log,
-                                &browser_encoders,
-                                &browser_capability_status,
-                                &output_url,
-                                &output_name,
+                                &job_ids,
+                                &results,
                             ),
                         }}
                     </div>
@@ -220,32 +275,29 @@ pub fn app() -> Html {
 
 fn page_title(tab: Tab) -> &'static str {
     match tab {
-        Tab::Input => "Input",
-        Tab::Tracks => "Track List",
+        Tab::Media => "Media",
         Tab::Convert => "Convert",
-        Tab::Utilities => "Utilities",
         Tab::Queue => "Queue",
     }
 }
 
 fn page_subtitle(tab: Tab) -> &'static str {
     match tab {
-        Tab::Input => "Add media files and choose muxing or batch processing.",
-        Tab::Tracks => "Enable, rename, reorder, copy, strip, or transcode streams.",
+        Tab::Media => "Add files and set per-stream copy, strip, or transcode.",
         Tab::Convert => "Tune container, codecs, quality, resize, crop, and audio settings.",
-        Tab::Utilities => "Build analysis, metadata, concat, and bitrate sampling commands.",
-        Tab::Queue => "Run the encode entirely in your browser with FFmpeg WASM.",
+        Tab::Queue => "Batch-encode every input on the server with native FFmpeg.",
     }
 }
 
-fn view_input(
+fn view_media(
     state: &UseStateHandle<AppState>,
-    browser_files: &Rc<RefCell<HashMap<usize, File>>>,
+    job_ids: &Rc<RefCell<HashMap<usize, String>>>,
     job_log: &UseStateHandle<String>,
+    browser_encoders: &UseStateHandle<Vec<BrowserEncoder>>,
 ) -> Html {
     let on_files = {
         let state = state.clone();
-        let browser_files = browser_files.clone();
+        let job_ids = job_ids.clone();
         let job_log = job_log.clone();
         Callback::from(move |event: Event| {
             let input: HtmlInputElement = event.target_unchecked_into();
@@ -253,84 +305,112 @@ fn view_input(
                 return;
             };
 
-            let mut next = (*state).clone();
-            let mut new_files = Vec::new();
-            let mut probes = Vec::new();
+            // State captured at this render. Async probe callbacks must rebuild
+            // the file list from this stable `base` (+ the shared track
+            // accumulator below) rather than cloning the `state` handle, whose
+            // value is frozen at this render — cloning it in an async task would
+            // clobber the optimistic insert and make files vanish on upload.
+            let base = (*state).clone();
+            let start = base.files.len();
+            let mut pending: Vec<(usize, MediaFile, File)> = Vec::new();
             for index in 0..files.length() {
                 if let Some(file) = files.get(index) {
-                    let id = next.files.len() + new_files.len() + 1;
-                    browser_files.borrow_mut().insert(id, file.clone());
-                    probes.push((id, file.clone(), file.name()));
-                    new_files.push(file_to_media(id, &file));
+                    let id = start + pending.len() + 1;
+                    let media = file_to_media(id, &file);
+                    pending.push((id, media, file));
                 }
             }
+            if pending.is_empty() {
+                return;
+            }
 
-            if !new_files.is_empty() {
-                next.selected_file = new_files.first().map(|file| file.id);
-                next.files.extend(new_files);
-                state.set(next);
-                job_log.set("Probing media streams with FFmpeg WASM...".into());
+            // Optimistic render so files appear immediately while probing.
+            let mut next = base.clone();
+            next.files
+                .extend(pending.iter().map(|(_, media, _)| media.clone()));
+            if next.selected_file.is_none() {
+                next.selected_file = pending.first().map(|(id, _, _)| *id);
+            }
+            state.set(next);
+            job_log.set("Uploading and probing media on the server...".into());
 
-                for (id, file, name) in probes {
-                    let state = state.clone();
-                    let job_log = job_log.clone();
-                    spawn_local(async move {
-                        match probe_media(file, name.clone()).await {
-                            Ok(result) => {
-                                let tracks = tracks_from_probe(&result);
-                                let log = Reflect::get(&result, &JsValue::from_str("log"))
-                                    .ok()
-                                    .and_then(|value| value.as_string())
-                                    .unwrap_or_default();
-                                if tracks.is_empty() {
-                                    job_log.set(format!(
-                                        "FFmpeg probe finished for {name}, but no streams were parsed.\n\n{log}"
-                                    ));
-                                } else {
-                                    let mut next = (*state).clone();
-                                    if let Some(media) =
-                                        next.files.iter_mut().find(|media| media.id == id)
-                                    {
-                                        media.tracks = merge_probe_tracks(&media.tracks, tracks);
+            let base = Rc::new(base);
+            let pending_meta: Rc<Vec<(usize, MediaFile)>> =
+                Rc::new(pending.iter().map(|(id, m, _)| (*id, m.clone())).collect());
+            let acc: Rc<RefCell<HashMap<usize, Vec<Track>>>> =
+                Rc::new(RefCell::new(HashMap::new()));
+
+            for (id, media, file) in pending {
+                let state = state.clone();
+                let job_log = job_log.clone();
+                let job_ids = job_ids.clone();
+                let base = base.clone();
+                let pending_meta = pending_meta.clone();
+                let acc = acc.clone();
+                let name = media.name.clone();
+                spawn_local(async move {
+                    match probe_media(file).await {
+                        Ok(result) => match parse_json::<ProbeResponse>(result) {
+                            Ok(probe) => {
+                                job_ids.borrow_mut().insert(id, probe.job_id);
+                                acc.borrow_mut().insert(id, probe.tracks);
+                                // Rebuild the authoritative file list from the
+                                // stable base plus whatever tracks have arrived.
+                                let mut next = (*base).clone();
+                                for (pid, pmeta) in pending_meta.iter() {
+                                    let mut media = pmeta.clone();
+                                    if let Some(tracks) = acc.borrow().get(pid) {
+                                        media.tracks = tracks.clone();
                                     }
-                                    state.set(next);
-                                    job_log.set(format!("Loaded stream metadata for {name}."));
+                                    next.files.push(media);
                                 }
+                                if next.selected_file.is_none() {
+                                    next.selected_file = pending_meta.first().map(|(id, _)| *id);
+                                }
+                                state.set(next);
+                                job_log.set(format!("Loaded stream metadata for {name}."));
                             }
                             Err(error) => {
-                                job_log.set(format!(
-                                    "FFmpeg probe failed for {name}: {}",
-                                    js_error_text(error)
-                                ));
+                                job_log.set(format!("Probe parse failed for {name}: {error}"))
                             }
+                        },
+                        Err(error) => {
+                            job_log.set(format!(
+                                "Server probe failed for {name}: {}",
+                                js_error_text(error)
+                            ));
                         }
-                    });
-                }
+                    }
+                });
             }
         })
     };
 
     html! {
-        <div class="stack">
-            <section class="drop-zone">
-                <input id="file-picker" type="file" multiple=true onchange={on_files} />
-                <label for="file-picker">
-                    { icon("add") }
-                    <strong>{"Select media files"}</strong>
-                    <small>{"Streams are probed locally in the browser."}</small>
-                </label>
-            </section>
-
-            <div class="file-toolbar">
-                <button class="icon-button subtle material-symbols-rounded" title="Move selected file up" onclick={move_selected_file(state, -1)}>{"keyboard_arrow_up"}</button>
-                <button class="icon-button subtle material-symbols-rounded" title="Move selected file down" onclick={move_selected_file(state, 1)}>{"keyboard_arrow_down"}</button>
-                <button class="icon-button subtle material-symbols-rounded" title="Sort files by name" onclick={sort_files(state)}>{"sort_by_alpha"}</button>
-                <button class="icon-button subtle material-symbols-rounded" title="Load tracks from selected file" onclick={select_first_track_file(state)}>{"low_priority"}</button>
+        <div class="media-grid">
+            <div class="media-main">
+                { view_tracks(state, browser_encoders) }
             </div>
+            <aside class="media-files">
+                <section class="drop-zone">
+                    <input id="file-picker" type="file" multiple=true onchange={on_files} />
+                    <label for="file-picker">
+                        { icon("add") }
+                        <strong>{"Select media files"}</strong>
+                        <small>{"Files upload to the server and are probed with FFmpeg."}</small>
+                    </label>
+                </section>
 
-            <section class="file-list">
-                { for state.files.iter().map(|file| view_file_row(state, file)) }
-            </section>
+                <div class="file-toolbar">
+                    <button class="icon-button subtle material-symbols-rounded" title="Move selected file up" onclick={move_selected_file(state, -1)}>{"keyboard_arrow_up"}</button>
+                    <button class="icon-button subtle material-symbols-rounded" title="Move selected file down" onclick={move_selected_file(state, 1)}>{"keyboard_arrow_down"}</button>
+                    <button class="icon-button subtle material-symbols-rounded" title="Sort files by name" onclick={sort_files(state)}>{"sort_by_alpha"}</button>
+                </div>
+
+                <section class="file-list">
+                    { for state.files.iter().map(|file| view_file_row(state, file)) }
+                </section>
+            </aside>
         </div>
     }
 }
@@ -399,17 +479,6 @@ fn sort_files(state: &UseStateHandle<AppState>) -> Callback<MouseEvent> {
     })
 }
 
-fn select_first_track_file(state: &UseStateHandle<AppState>) -> Callback<MouseEvent> {
-    let state = state.clone();
-    Callback::from(move |_| {
-        let mut next = (*state).clone();
-        if next.selected_file.is_none() {
-            next.selected_file = next.files.first().map(|file| file.id);
-        }
-        state.set(next);
-    })
-}
-
 fn view_tracks(
     state: &UseStateHandle<AppState>,
     browser_encoders: &UseStateHandle<Vec<BrowserEncoder>>,
@@ -419,26 +488,6 @@ fn view_tracks(
     };
 
     let file_id = file.id;
-    let add_track = {
-        let state = state.clone();
-        Callback::from(move |_| {
-            let mut next = (*state).clone();
-            if let Some(file) = next.files.iter_mut().find(|file| file.id == file_id) {
-                let id = file.tracks.iter().map(|track| track.id).max().unwrap_or(0) + 1;
-                file.tracks.push(Track {
-                    id,
-                    source_index: id.saturating_sub(1),
-                    enabled: true,
-                    kind: StreamKind::Audio,
-                    codec: "Unknown".into(),
-                    language: "und".into(),
-                    title: "New track".into(),
-                    choice: TrackOutput::Copy,
-                });
-            }
-            state.set(next);
-        })
-    };
 
     html! {
         <div class="stack">
@@ -451,7 +500,6 @@ fn view_tracks(
                     <button class="icon-button subtle material-symbols-rounded" title="Check all" onclick={set_tracks_checked(state, file_id, true)}>{"select_check_box"}</button>
                     <button class="icon-button subtle material-symbols-rounded" title="Check none" onclick={set_tracks_checked(state, file_id, false)}>{"disabled_by_default"}</button>
                     <button class="icon-button subtle material-symbols-rounded" title="Sort tracks" onclick={sort_tracks(state, file_id)}>{"sort"}</button>
-                    <button class="command-button" onclick={add_track}>{"Add track"}</button>
                 </div>
             </div>
             <div class="default-track-row">
@@ -489,19 +537,8 @@ fn view_track_row(
                 checked={track.enabled}
                 onchange={update_track_bool(state, file_id, track_id, |track, value| track.enabled = value)}
             />
-            <select
-                value={track.kind.label()}
-                onchange={update_track_kind(state, file_id, track_id)}
-            >
-                { selected_option("Video", track.kind.label()) }
-                { selected_option("Audio", track.kind.label()) }
-                { selected_option("Subtitle", track.kind.label()) }
-                { selected_option("Attachment", track.kind.label()) }
-            </select>
-            <input
-                value={track.codec.clone()}
-                oninput={update_track_text(state, file_id, track_id, |track, value| track.codec = value)}
-            />
+            <span class="track-fact">{track.kind.label()}</span>
+            <span class="track-fact" title={track.codec.clone()}>{&track.codec}</span>
             <input
                 value={track.language.clone()}
                 oninput={update_track_text(state, file_id, track_id, |track, value| track.language = value)}
@@ -531,7 +568,6 @@ fn view_convert(state: &UseStateHandle<AppState>) -> Html {
         <div class="settings-grid">
             <section class="settings-group">
                 <div class="panel-title">{ icon("output") }<h2>{"Output"}</h2></div>
-                { text_field("Name", settings.output_name.clone(), update_convert_text(state, |settings, value| settings.output_name = value)) }
                 { select_field("Container", settings.container.clone(), &["mkv", "mp4", "mov", "webm", "gif"], update_convert_select(state, |settings, value| settings.container = value)) }
                 { select_field("Preset", settings.preset.clone(), &["ultrafast", "veryfast", "fast", "medium", "slow", "slower"], update_convert_select(state, |settings, value| settings.preset = value)) }
                 { select_field("Color Format", settings.color_format.clone(), &["source", "yuv420p", "yuv420p10le", "yuv444p", "rgb24"], update_convert_select(state, |settings, value| settings.color_format = value)) }
@@ -546,7 +582,6 @@ fn view_convert(state: &UseStateHandle<AppState>) -> Html {
                     { selected_option(QualityMode::ConstantQuality.label(), settings.quality_mode.label()) }
                     { selected_option(QualityMode::Bitrate.label(), settings.quality_mode.label()) }
                     { selected_option(QualityMode::FileSize.label(), settings.quality_mode.label()) }
-                    { selected_option(QualityMode::Vmaf.label(), settings.quality_mode.label()) }
                 </select>
                 { number_field("CRF / CQ", settings.quality_value, 1, 63, update_convert_number(state, |settings, value| settings.quality_value = value)) }
                 { number_field("Bitrate kbps", settings.bitrate_kbps, 64, 250000, update_convert_number(state, |settings, value| settings.bitrate_kbps = value)) }
@@ -558,17 +593,9 @@ fn view_convert(state: &UseStateHandle<AppState>) -> Html {
                 <div class="three-col">
                     { text_field("FPS", settings.fps.clone(), update_convert_text(state, |settings, value| settings.fps = value)) }
                     { text_field("Scale", settings.resize.clone(), update_convert_text(state, |settings, value| settings.resize = value)) }
-                    { select_field("Crop Mode", settings.crop_mode.clone(), &["Disable", "Manual", "Automatic"], update_convert_select(state, |settings, value| settings.crop_mode = value)) }
+                    { select_field("Crop Mode", settings.crop_mode.clone(), &["Disable", "Manual"], update_convert_select(state, |settings, value| settings.crop_mode = value)) }
                     { text_field("Crop", settings.crop.clone(), update_convert_text(state, |settings, value| settings.crop = value)) }
                 </div>
-                <label class="check-line">
-                    <input
-                        type="checkbox"
-                        checked={settings.burn_subtitles}
-                        onchange={update_convert_bool(state, |settings, value| settings.burn_subtitles = value)}
-                    />
-                    <span>{"Burn subtitle track"}</span>
-                </label>
             </section>
 
             <section class="settings-group">
@@ -596,17 +623,13 @@ fn view_convert(state: &UseStateHandle<AppState>) -> Html {
                     { text_field("Trim End", settings.trim_end.clone(), update_convert_text(state, |settings, value| settings.trim_end = value)) }
                     { text_field("Duration", settings.trim_duration.clone(), update_convert_text(state, |settings, value| settings.trim_duration = value)) }
                 </div>
-                <div class="two-col">
-                    { text_field("Custom Args In", settings.custom_args_in.clone(), update_convert_text(state, |settings, value| settings.custom_args_in = value)) }
-                    { text_field("Custom Args Out", settings.custom_args_out.clone(), update_convert_text(state, |settings, value| settings.custom_args_out = value)) }
-                </div>
             </section>
 
             <section class="settings-group wide">
                 <div class="panel-title">{ icon("newspaper") }<h2>{"Metadata"}</h2></div>
                 <div class="two-col">
-                    { select_field("Copy Metadata From", settings.metadata_mode.clone(), &["Copy All From Input, Edit Titles/Languages", "Apply Titles/Languages, Strip Rest", "Strip All Metadata Including Titles/Languages"], update_convert_select(state, |settings, value| settings.metadata_mode = value)) }
-                    { select_field("Copy Chapters From", settings.chapter_mode.clone(), &["Copy All From Input, Edit Titles/Languages", "Apply Titles/Languages, Strip Rest", "Strip All Metadata Including Titles/Languages"], update_convert_select(state, |settings, value| settings.chapter_mode = value)) }
+                    { select_field("Metadata", settings.metadata_mode.clone(), &[METADATA_COPY, METADATA_STRIP_KEEP_TRACKS, METADATA_STRIP_ALL], update_convert_select(state, |settings, value| settings.metadata_mode = value)) }
+                    { select_field("Chapters", settings.chapter_mode.clone(), &[CHAPTERS_COPY, CHAPTERS_STRIP], update_convert_select(state, |settings, value| settings.chapter_mode = value)) }
                 </div>
                 <label class="check-line">
                     <input
@@ -621,206 +644,209 @@ fn view_convert(state: &UseStateHandle<AppState>) -> Html {
     }
 }
 
-fn view_utilities(state: &UseStateHandle<AppState>, command: &str) -> Html {
-    html! {
-        <div class="stack">
-            <section class="utility-grid">
-                { for Utility::ALL.iter().map(|utility| {
-                    let item = *utility;
-                    let active = state.utility == item;
-                    let state = state.clone();
-                    html! {
-                        <button
-                            class={classes!("utility-card", active.then_some("active"))}
-                            onclick={Callback::from(move |_| {
-                                let mut next = (*state).clone();
-                                next.utility = item;
-                                state.set(next);
-                            })}
-                        >
-                            <strong>{item.label()}</strong>
-                            <span>{item.description()}</span>
-                        </button>
-                    }
-                })}
-            </section>
-            <section class="settings-group wide">
-                <div class="panel-title">{ icon("construction") }<h2>{state.utility.label()}</h2></div>
-                <textarea class="command-box tall" readonly=true value={command.to_owned()} />
-            </section>
-        </div>
-    }
-}
-
 fn view_queue(
     state: &UseStateHandle<AppState>,
-    browser_files: &Rc<RefCell<HashMap<usize, File>>>,
-    command: &str,
-    on_copy: &Callback<MouseEvent>,
-    copied: bool,
-    job_log: &UseStateHandle<String>,
-    browser_encoders: &UseStateHandle<Vec<BrowserEncoder>>,
-    browser_capability_status: &UseStateHandle<String>,
-    output_url: &UseStateHandle<String>,
-    output_name: &UseStateHandle<String>,
+    job_ids: &Rc<RefCell<HashMap<usize, String>>>,
+    results: &UseStateHandle<Vec<EncodeItem>>,
 ) -> Html {
-    let detect_capabilities = {
-        let browser_encoders = browser_encoders.clone();
-        let browser_capability_status = browser_capability_status.clone();
-        let job_log = job_log.clone();
-        Callback::from(move |_| {
-            browser_capability_status.set("Checking bundled FFmpeg WASM encoders...".into());
-            job_log.set("Checking bundled FFmpeg WASM encoders...".into());
+    let ready = state
+        .files
+        .iter()
+        .filter(|file| job_ids.borrow().contains_key(&file.id))
+        .count();
 
-            let browser_encoders = browser_encoders.clone();
-            let browser_capability_status = browser_capability_status.clone();
-            let job_log = job_log.clone();
-            spawn_local(async move {
-                match fetch_browser_encoders().await {
-                    Ok((encoders, log)) => {
-                        let summary = browser_codec_summary(&encoders);
-                        browser_encoders.set(encoders);
-                        browser_capability_status.set(summary.clone());
-                        job_log.set(format!("{summary}\n\n{log}"));
-                    }
-                    Err(error) => {
-                        let message =
-                            format!("Browser capability check failed: {}", js_error_text(error));
-                        browser_capability_status.set(message.clone());
-                        job_log.set(message);
-                    }
-                }
-            });
-        })
-    };
-
-    let run_job = {
+    let run_batch = {
         let state = state.clone();
-        let browser_files = browser_files.clone();
-        let job_log = job_log.clone();
-        let output_url = output_url.clone();
-        let output_name = output_name.clone();
+        let job_ids = job_ids.clone();
+        let results = results.clone();
         Callback::from(move |_| {
-            let Some(file_id) = state.selected_file else {
-                job_log.set("Select an input before running a browser encode.".into());
-                return;
-            };
+            // Snapshot every ready input up front (job id, per-file tracks,
+            // per-file output name). The whole batch runs in one task so the
+            // authoritative result list lives in `items` here — we only ever
+            // write it to the state handle, never read the (stale) handle back.
+            let settings = (*state).convert.clone();
+            let mut jobs: Vec<(String, String, String, String)> = Vec::new();
+            for file in state.files.iter() {
+                let Some(job_id) = job_ids.borrow().get(&file.id).cloned() else {
+                    continue;
+                };
+                let mut per_file = settings.clone();
+                // Derive the output base from the input name minus its extension,
+                // so "clip.mkv" → "clip" (not "clip.mkv.mkv" once the container
+                // extension is appended server-side).
+                let stem = file
+                    .name
+                    .rsplit_once('.')
+                    .map(|(base, _)| base)
+                    .unwrap_or(&file.name);
+                per_file.output_name = crate::core::safe_stem(stem);
+                let (Ok(settings_json), Ok(tracks_json)) = (
+                    serde_json::to_string(&per_file),
+                    serde_json::to_string(&file.tracks),
+                ) else {
+                    continue;
+                };
+                jobs.push((file.name.clone(), job_id, settings_json, tracks_json));
+            }
 
-            let Some(file) = browser_files.borrow().get(&file_id).cloned() else {
-                job_log.set("Browser execution needs an input selected from this page.".into());
-                return;
-            };
-
-            let Some(selected) = state.selected_file().cloned() else {
-                job_log.set("Select an input before running a browser encode.".into());
-                return;
-            };
-
-            let args = ffmpeg_args(&state);
-            if args.is_empty() {
-                job_log.set("No FFmpeg arguments were generated for this job.".into());
+            if jobs.is_empty() {
                 return;
             }
 
-            let output = output_file_name(&state);
-
-            output_url.set(String::new());
-            output_name.set(output.clone());
-
-            let job_log_async = job_log.clone();
-            let output_url_async = output_url.clone();
+            let results = results.clone();
             spawn_local(async move {
-                let js_args = Array::new();
-                for arg in args {
-                    js_args.push(&JsValue::from_str(&arg));
-                }
+                let mut items: Vec<EncodeItem> = jobs
+                    .iter()
+                    .map(|(name, job_id, ..)| EncodeItem {
+                        name: name.clone(),
+                        job_id: job_id.clone(),
+                        status: EncodeStatus::Running,
+                        log: String::new(),
+                        download_url: String::new(),
+                        output_name: String::new(),
+                    })
+                    .collect();
+                results.set(items.clone());
 
-                job_log_async.set("Loading FFmpeg WASM and starting job...".into());
-                match run_ffmpeg(file, selected.name, output.clone(), js_args.into()).await {
-                    Ok(result) => {
-                        let url = Reflect::get(&result, &JsValue::from_str("url"))
-                            .ok()
-                            .and_then(|value| value.as_string())
-                            .unwrap_or_default();
-                        let log = Reflect::get(&result, &JsValue::from_str("log"))
-                            .ok()
-                            .and_then(|value| value.as_string())
-                            .unwrap_or_else(|| "Browser encode complete.".into());
-                        output_url_async.set(url);
-                        job_log_async.set(log);
+                for (index, (_, job_id, settings_json, tracks_json)) in jobs.into_iter().enumerate()
+                {
+                    match run_encode(job_id, settings_json, tracks_json).await {
+                        Ok(value) => match parse_json::<EncodeResponse>(value) {
+                            Ok(response) => {
+                                items[index].status = if response.ok {
+                                    EncodeStatus::Done
+                                } else {
+                                    EncodeStatus::Failed
+                                };
+                                items[index].log = response.log;
+                                items[index].output_name = response.output_name;
+                                items[index].download_url = response.download_url;
+                            }
+                            Err(error) => {
+                                items[index].status = EncodeStatus::Failed;
+                                items[index].log = format!("Encode parse failed: {error}");
+                            }
+                        },
+                        Err(error) => {
+                            items[index].status = EncodeStatus::Failed;
+                            items[index].log =
+                                format!("Server encode failed: {}", js_error_text(error));
+                        }
                     }
-                    Err(error) => {
-                        job_log_async
-                            .set(format!("Browser encode failed: {}", js_error_text(error)));
-                    }
+                    results.set(items.clone());
                 }
             });
         })
     };
 
     html! {
-        <div class="stack">
+        <div class="stack queue-stack">
             <section class="queue-board">
                 <div class="queue-metric">
                     <span>{state.files.len()}</span>
                     <small>{"inputs"}</small>
                 </div>
                 <div class="queue-metric">
-                    <span>{state.selected_file().map(|file| file.tracks.iter().filter(|track| track.enabled).count()).unwrap_or(0)}</span>
-                    <small>{"streams"}</small>
+                    <span>{ready}</span>
+                    <small>{"ready"}</small>
                 </div>
                 <div class="queue-metric">
                     <span>{"FFmpeg"}</span>
                     <small>{"backend"}</small>
                 </div>
                 <div class="queue-metric">
-                    <span>{ if browser_encoders.is_empty() { "?".to_owned() } else { browser_encoders.len().to_string() } }</span>
-                    <small>{"browser encoders"}</small>
+                    <span>{state.convert.container.clone()}</span>
+                    <small>{"container"}</small>
                 </div>
             </section>
-            <section class="settings-group wide">
-                <div class="panel-title">{ icon("terminal") }<h2>{"Generated Job"}</h2></div>
-                <textarea class="command-box tall" readonly=true value={command.to_owned()} />
-                <div class="preview-actions">
-                    <button class="command-button" onclick={on_copy.clone()}>{ if copied { "Copied" } else { "Copy command" } }</button>
-                    <button class="command-button" onclick={detect_capabilities}>{"Detect browser codecs"}</button>
-                    <button class="command-button accent" onclick={run_job}>{"Run in browser"}</button>
+            <section class="settings-group wide runtime-panel">
+                <div class="panel-title">
+                    <div class="panel-title-label">{ icon("play_circle") }<h2>{"Server Runtime"}</h2></div>
+                    {{
+                        let done_ids: Vec<String> = results
+                            .iter()
+                            .filter(|r| r.status == EncodeStatus::Done)
+                            .map(|r| r.job_id.clone())
+                            .collect();
+                        if results.is_empty() {
+                            Html::default()
+                        } else {
+                            let zip_link = if done_ids.len() > 1 {
+                                let href = format!("/api/zip?jobs={}", done_ids.join(","));
+                                html! {
+                                    <a class="command-button accent result-download" href={href} download="webcoder-batch.zip">
+                                        { icon("folder_zip") }
+                                        { "Download all" }
+                                    </a>
+                                }
+                            } else {
+                                Html::default()
+                            };
+                            html! {
+                                <div class="runtime-actions">
+                                    <span class="result-status">{ format!("{}/{} done", done_ids.len(), results.len()) }</span>
+                                    { zip_link }
+                                </div>
+                            }
+                        }
+                    }}
                 </div>
-                <div class="codec-summary">{(**browser_capability_status).clone()}</div>
+                <button class="command-button accent" onclick={run_batch} disabled={ready == 0}>
+                    { format!("RUN ({ready})") }
+                </button>
+                <div class="results-list">
+                    { if results.is_empty() {
+                        html! { <div class="result-empty">
+                            { if ready == 0 { "Add inputs on the Media page." } else { "Ready. Press RUN to batch-encode." } }
+                        </div> }
+                    } else {
+                        html! { for results.iter().map(view_result_row) }
+                    } }
+                </div>
             </section>
-            <section class="settings-group wide">
-                <div class="panel-title">{ icon("play_circle") }<h2>{"Browser Runtime"}</h2></div>
-                <textarea class="command-box log" readonly=true value={(**job_log).clone()} />
+        </div>
+    }
+}
+
+fn view_result_row(item: &EncodeItem) -> Html {
+    let (badge, label, status_class) = match item.status {
+        EncodeStatus::Running => ("hourglass_top", "Encoding", "is-running"),
+        EncodeStatus::Done => ("check_circle", "Done", "is-done"),
+        EncodeStatus::Failed => ("error", "Failed", "is-failed"),
+    };
+    let open = item.status == EncodeStatus::Failed;
+    html! {
+        <div class={classes!("result-card", status_class)}>
+            <div class="result-head">
+                <span class="material-symbols-rounded result-badge">{badge}</span>
+                <strong>{&item.name}</strong>
+                <span class="result-status">{label}</span>
                 {
-                    if !output_url.is_empty() {
+                    if !item.download_url.is_empty() {
                         html! {
-                            <a class="download-link" href={(**output_url).clone()} download={(**output_name).clone()}>
-                                {format!("Download {}", **output_name)}
+                            <a class="command-button accent result-download" href={item.download_url.clone()} download={item.output_name.clone()}>
+                                { icon("download") }
+                                { "Download" }
                             </a>
                         }
                     } else {
                         Html::default()
                     }
                 }
-            </section>
+            </div>
+            {
+                if item.log.is_empty() {
+                    Html::default()
+                } else {
+                    html! {
+                        <details class="result-log" open={open}>
+                            <summary>{"Log"}</summary>
+                            <textarea class="command-box log" readonly=true value={item.log.clone()} />
+                        </details>
+                    }
+                }
+            }
         </div>
-    }
-}
-
-fn mode_button(state: &UseStateHandle<AppState>, mode: Mode) -> Html {
-    let active = state.convert.mode == mode;
-    let state = state.clone();
-    html! {
-        <button
-            class={classes!("segmented-button", active.then_some("active"))}
-            onclick={Callback::from(move |_| {
-                let mut next = (*state).clone();
-                next.convert.mode = mode;
-                state.set(next);
-            })}
-        >
-            {mode.label()}
-        </button>
     }
 }
 
@@ -915,150 +941,6 @@ fn guessed_video_codec(name: &str) -> &'static str {
     } else {
         "Video"
     }
-}
-
-fn tracks_from_probe(result: &JsValue) -> Vec<Track> {
-    let streams = Reflect::get(result, &JsValue::from_str("streams")).unwrap_or(JsValue::NULL);
-    let array = Array::from(&streams);
-    let mut tracks = Vec::new();
-
-    for index in 0..array.length() {
-        let stream = array.get(index);
-        let kind = js_string(&stream, "kind");
-        let stream_kind = match kind.as_str() {
-            "Video" => StreamKind::Video,
-            "Audio" => StreamKind::Audio,
-            "Subtitle" => StreamKind::Subtitle,
-            "Attachment" | "Data" => StreamKind::Attachment,
-            _ => StreamKind::Video,
-        };
-
-        tracks.push(Track {
-            id: index as usize + 1,
-            source_index: js_number(&stream, "index").unwrap_or(index as usize),
-            enabled: stream_kind != StreamKind::Attachment,
-            kind: stream_kind,
-            codec: joined_probe_codec(&stream),
-            language: js_string(&stream, "language")
-                .chars()
-                .take(3)
-                .collect::<String>()
-                .to_ascii_lowercase(),
-            title: js_string(&stream, "title"),
-            choice: TrackOutput::Copy,
-        });
-    }
-
-    tracks
-}
-
-fn merge_probe_tracks(existing: &[Track], probed: Vec<Track>) -> Vec<Track> {
-    let mut used = vec![false; existing.len()];
-
-    probed
-        .into_iter()
-        .map(|mut probed_track| {
-            let exact_match = existing.iter().enumerate().position(|(index, track)| {
-                !used[index]
-                    && track.source_index == probed_track.source_index
-                    && track.kind == probed_track.kind
-            });
-
-            let kind_match = exact_match.or_else(|| {
-                existing
-                    .iter()
-                    .enumerate()
-                    .position(|(index, track)| !used[index] && track.kind == probed_track.kind)
-            });
-
-            if let Some(existing_index) = kind_match {
-                used[existing_index] = true;
-                let existing_track = &existing[existing_index];
-                probed_track.enabled = existing_track.enabled;
-                probed_track.choice = existing_track.choice.clone();
-            }
-
-            probed_track
-        })
-        .collect()
-}
-
-fn joined_probe_codec(stream: &JsValue) -> String {
-    let codec = js_string(stream, "codec");
-    let details = js_string(stream, "details");
-    if details.is_empty() {
-        codec
-    } else {
-        format!("{codec} ({details})")
-    }
-}
-
-fn js_string(value: &JsValue, key: &str) -> String {
-    Reflect::get(value, &JsValue::from_str(key))
-        .ok()
-        .and_then(|value| value.as_string())
-        .unwrap_or_default()
-}
-
-fn js_number(value: &JsValue, key: &str) -> Option<usize> {
-    Reflect::get(value, &JsValue::from_str(key))
-        .ok()
-        .and_then(|value| value.as_f64())
-        .filter(|value| value.is_finite() && *value >= 0.0)
-        .map(|value| value as usize)
-}
-
-async fn fetch_browser_encoders() -> Result<(Vec<BrowserEncoder>, String), JsValue> {
-    let result = get_ffmpeg_capabilities().await?;
-    Ok((
-        browser_encoders_from_js(&result),
-        js_string(&result, "log"),
-    ))
-}
-
-fn browser_encoders_from_js(value: &JsValue) -> Vec<BrowserEncoder> {
-    let Ok(array_value) = Reflect::get(value, &JsValue::from_str("encoders")) else {
-        return Vec::new();
-    };
-    if !Array::is_array(&array_value) {
-        return Vec::new();
-    }
-
-    let array = Array::from(&array_value);
-    (0..array.length())
-        .filter_map(|index| {
-            let item = array.get(index);
-            let name = js_string(&item, "name");
-            if name.is_empty() {
-                return None;
-            }
-            let kind = match js_string(&item, "kind").as_str() {
-                "Audio" => StreamKind::Audio,
-                "Subtitle" => StreamKind::Subtitle,
-                _ => StreamKind::Video,
-            };
-            Some(BrowserEncoder {
-                name,
-                kind,
-                description: js_string(&item, "description"),
-            })
-        })
-        .collect()
-}
-
-fn browser_codec_summary(encoders: &[BrowserEncoder]) -> String {
-    if encoders.is_empty() {
-        return "No browser encoders detected.".into();
-    }
-
-    let count = |kind: StreamKind| encoders.iter().filter(|e| e.kind == kind).count();
-    format!(
-        "Detected {} browser encoders: {} video, {} audio, {} subtitle.",
-        encoders.len(),
-        count(StreamKind::Video),
-        count(StreamKind::Audio),
-        count(StreamKind::Subtitle),
-    )
 }
 
 /// Build the output-codec `<option>` list for a track: `Copy`/`Strip` plus
@@ -1199,32 +1081,6 @@ fn update_track_bool(
     })
 }
 
-fn update_track_kind(
-    state: &UseStateHandle<AppState>,
-    file_id: usize,
-    track_id: usize,
-) -> Callback<Event> {
-    let state = state.clone();
-    Callback::from(move |event: Event| {
-        let value = event.target_unchecked_into::<HtmlSelectElement>().value();
-        let kind = match value.as_str() {
-            "Video" => StreamKind::Video,
-            "Audio" => StreamKind::Audio,
-            "Subtitle" => StreamKind::Subtitle,
-            "Attachment" => StreamKind::Attachment,
-            _ => StreamKind::Video,
-        };
-        update_track(&state, file_id, track_id, |track| {
-            track.kind = kind;
-            // An encoder is kind-specific; changing the stream type invalidates
-            // it, so fall back to the always-valid Copy. Copy/Strip carry over.
-            if matches!(track.choice, TrackOutput::Encoder(_)) {
-                track.choice = TrackOutput::Copy;
-            }
-        });
-    })
-}
-
 fn update_track_codec(
     state: &UseStateHandle<AppState>,
     file_id: usize,
@@ -1234,7 +1090,9 @@ fn update_track_codec(
     Callback::from(move |event: Event| {
         let value = event.target_unchecked_into::<HtmlSelectElement>().value();
         let choice = TrackOutput::from_label(&value);
-        update_track(&state, file_id, track_id, |track| track.choice = choice.clone());
+        update_track(&state, file_id, track_id, |track| {
+            track.choice = choice.clone()
+        });
     })
 }
 
@@ -1334,7 +1192,6 @@ fn update_quality_mode(state: &UseStateHandle<AppState>) -> Callback<Event> {
         next.convert.quality_mode = match value.as_str() {
             "Target bitrate" => QualityMode::Bitrate,
             "Target file size" => QualityMode::FileSize,
-            "Target VMAF" => QualityMode::Vmaf,
             _ => QualityMode::ConstantQuality,
         };
         state.set(next);
@@ -1406,15 +1263,4 @@ fn copy_to_clipboard(text: &str) {
         let clipboard = window.navigator().clipboard();
         let _ = clipboard.write_text(text);
     }
-}
-
-fn js_error_text(error: JsValue) -> String {
-    error
-        .as_string()
-        .or_else(|| {
-            Reflect::get(&error, &JsValue::from_str("message"))
-                .ok()
-                .and_then(|value| value.as_string())
-        })
-        .unwrap_or_else(|| "unknown JavaScript error".into())
 }
