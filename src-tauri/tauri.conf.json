@@ -19,6 +19,10 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "icon": [
+      "icons/icon.png",
+      "icons/128x128.png"
+    ],
     "resources": {
       "../dist": "dist"
     }
