@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{Mutex, Semaphore};
 
-use crate::core::{self, ConvertSettings, StreamKind, Track, TrackOutput};
+use webcoder_frontend::core::{self, ConvertSettings, StreamKind, Track, TrackOutput};
 
 #[derive(Clone)]
 struct Config {
@@ -47,6 +47,7 @@ struct Config {
     ffmpeg: String,
     ffprobe: String,
     auth: Option<(String, String)>,
+    api_key: Option<String>,
 }
 
 impl Config {
@@ -80,12 +81,14 @@ impl Config {
             ffmpeg: std::env::var("WEBCODER_FFMPEG").unwrap_or_else(|_| "ffmpeg".into()),
             ffprobe: std::env::var("WEBCODER_FFPROBE").unwrap_or_else(|_| "ffprobe".into()),
             auth,
+            api_key: None,
         }
     }
 }
 
 struct JobEntry {
     dir: PathBuf,
+    input: PathBuf,
     stream_count: usize,
     created: Instant,
 }
@@ -109,6 +112,48 @@ struct EncoderInfo {
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env();
+    let addr = std::env::var("WEBCODER_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    eprintln!("webcoder: listening on http://{addr}");
+    serve(config, listener).await
+}
+
+pub async fn run_with_listener(
+    listener: tokio::net::TcpListener,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = Config::from_env();
+    let addr = listener.local_addr()?;
+    eprintln!("webcoder: listening on http://{addr}");
+    serve(config, listener).await
+}
+
+pub async fn run_with_paths(
+    listener: tokio::net::TcpListener,
+    dist: PathBuf,
+    workdir: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    run_with_paths_and_key(listener, dist, workdir, None).await
+}
+
+pub async fn run_with_paths_and_key(
+    listener: tokio::net::TcpListener,
+    dist: PathBuf,
+    workdir: PathBuf,
+    api_key: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut config = Config::from_env();
+    config.dist = dist;
+    config.workdir = workdir;
+    config.api_key = api_key;
+    let addr = listener.local_addr()?;
+    eprintln!("webcoder: listening on http://{addr}");
+    serve(config, listener).await
+}
+
+async fn serve(
+    config: Config,
+    listener: tokio::net::TcpListener,
+) -> Result<(), Box<dyn std::error::Error>> {
     tokio::fs::create_dir_all(&config.workdir).await?;
 
     let encoders = probe_encoders(&config.ffmpeg).await?;
@@ -134,6 +179,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let api = Router::new()
         .route("/api/encoders", get(get_encoders))
         .route("/api/jobs", post(create_job))
+        .route("/api/jobs/from-path", post(create_job_from_path))
         .route("/api/jobs/:id/encode", post(encode_job))
         .route("/api/jobs/:id/output", get(get_output))
         .route("/api/zip", get(zip_outputs))
@@ -148,9 +194,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .layer(middleware::from_fn_with_state(state.clone(), auth_layer))
         .with_state(state);
 
-    let addr = std::env::var("WEBCODER_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    eprintln!("webcoder: listening on http://{addr}");
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -163,8 +206,14 @@ async fn auth_layer(
     request: axum::extract::Request,
     next: Next,
 ) -> Response {
+    let path = request.uri().path().to_owned();
+    let query = request.uri().query().unwrap_or_default().to_owned();
+
     let Some((user, pass)) = &state.config.auth else {
-        return next.run(request).await;
+        if api_key_allowed(&state.config.api_key, &headers, &query, &path) {
+            return next.run(request).await;
+        }
+        return unauthorized("API key required.");
     };
 
     if let Some(value) = headers
@@ -176,17 +225,46 @@ async fn auth_layer(
     {
         if let Some((u, p)) = value.split_once(':') {
             if constant_eq(u, user) && constant_eq(p, pass) {
-                return next.run(request).await;
+                if api_key_allowed(&state.config.api_key, &headers, &query, &path) {
+                    return next.run(request).await;
+                }
+                return unauthorized("API key required.");
             }
         }
     }
 
+    unauthorized("Authentication required.")
+}
+
+fn unauthorized(message: &'static str) -> Response {
     (
         StatusCode::UNAUTHORIZED,
         [(header::WWW_AUTHENTICATE, "Basic realm=\"webcoder\"")],
-        "Authentication required.",
+        message,
     )
         .into_response()
+}
+
+fn api_key_allowed(
+    expected: &Option<String>,
+    headers: &HeaderMap,
+    query: &str,
+    path: &str,
+) -> bool {
+    if !path.starts_with("/api/") && path != "/api" {
+        return true;
+    }
+    let Some(expected) = expected else {
+        return true;
+    };
+    let header_key = headers.get("x-webcoder-key").and_then(|v| v.to_str().ok());
+    let query_key = query.split('&').find_map(|part| {
+        let (key, value) = part.split_once('=')?;
+        (key == "webcoder_key").then_some(value)
+    });
+    header_key
+        .or(query_key)
+        .is_some_and(|value| constant_eq(value, expected))
 }
 
 /// Compare in time independent of where the first mismatch is, so a matching
@@ -215,6 +293,8 @@ struct CreateJobResponse {
     stream_count: usize,
     tracks: Vec<Track>,
     format: Option<Value>,
+    file_name: Option<String>,
+    size_bytes: Option<u64>,
 }
 
 async fn create_job(
@@ -266,6 +346,7 @@ async fn create_job(
         job_id.clone(),
         JobEntry {
             dir,
+            input: input_path,
             stream_count,
             created: Instant::now(),
         },
@@ -276,6 +357,63 @@ async fn create_job(
         stream_count,
         tracks,
         format,
+        file_name: None,
+        size_bytes: None,
+    }))
+}
+
+#[derive(Deserialize)]
+struct CreateJobFromPathRequest {
+    path: PathBuf,
+}
+
+async fn create_job_from_path(
+    State(state): State<Shared>,
+    Json(req): Json<CreateJobFromPathRequest>,
+) -> Result<Json<CreateJobResponse>, ApiError> {
+    if state.config.api_key.is_none() {
+        return Err(ApiError::forbidden(
+            "Path-based jobs are only available in desktop mode.",
+        ));
+    }
+    if !req.path.is_file() {
+        return Err(ApiError::bad_request("Selected path is not a file."));
+    }
+
+    let job_id = uuid::Uuid::new_v4().to_string();
+    let dir = state.config.workdir.join(&job_id);
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| ApiError::internal(format!("create job dir: {e}")))?;
+
+    let metadata = tokio::fs::metadata(&req.path)
+        .await
+        .map_err(|e| ApiError::bad_request(format!("read file metadata: {e}")))?;
+    let (tracks, stream_count, format) = probe_input(&state.config.ffprobe, &req.path)
+        .await
+        .map_err(|e| ApiError::bad_request(format!("probe failed: {e}")))?;
+    let file_name = req
+        .path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned());
+
+    state.jobs.lock().await.insert(
+        job_id.clone(),
+        JobEntry {
+            dir,
+            input: req.path,
+            stream_count,
+            created: Instant::now(),
+        },
+    );
+
+    Ok(Json(CreateJobResponse {
+        job_id,
+        stream_count,
+        tracks,
+        format,
+        file_name,
+        size_bytes: Some(metadata.len()),
     }))
 }
 
@@ -298,12 +436,12 @@ async fn encode_job(
     Path(id): Path<String>,
     Json(req): Json<EncodeRequest>,
 ) -> Result<Json<EncodeResponse>, ApiError> {
-    let (dir, stream_count) = {
+    let (dir, input, stream_count) = {
         let jobs = state.jobs.lock().await;
         let entry = jobs
             .get(&id)
             .ok_or_else(|| ApiError::not_found("Unknown or expired job."))?;
-        (entry.dir.clone(), entry.stream_count)
+        (entry.dir.clone(), entry.input.clone(), entry.stream_count)
     };
 
     core::validate_job(
@@ -314,9 +452,6 @@ async fn encode_job(
     )
     .map_err(ApiError::unprocessable)?;
 
-    let input = find_input(&dir)
-        .await
-        .ok_or_else(|| ApiError::internal("Job input missing."))?;
     let output_name = format!(
         "{}.{}",
         core::safe_stem(&req.settings.output_name),
@@ -668,27 +803,12 @@ async fn probe_input(
     Ok((tracks, stream_count, format))
 }
 
-async fn find_input(dir: &PathBuf) -> Option<PathBuf> {
-    find_by_prefix(dir, "input.").await
-}
-
 async fn find_output(dir: &PathBuf) -> Option<PathBuf> {
     // The encode writes its single result into the job's `out/` subdir under the
     // friendly output name; return that file.
     let mut rd = tokio::fs::read_dir(dir.join("out")).await.ok()?;
     while let Ok(Some(entry)) = rd.next_entry().await {
         if entry.path().is_file() {
-            return Some(entry.path());
-        }
-    }
-    None
-}
-
-async fn find_by_prefix(dir: &PathBuf, prefix: &str) -> Option<PathBuf> {
-    let mut rd = tokio::fs::read_dir(dir).await.ok()?;
-    while let Ok(Some(entry)) = rd.next_entry().await {
-        let name = entry.file_name();
-        if name.to_string_lossy().starts_with(prefix) {
             return Some(entry.path());
         }
     }
@@ -749,6 +869,9 @@ impl ApiError {
     }
     fn not_found(m: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_FOUND, m)
+    }
+    fn forbidden(m: impl Into<String>) -> Self {
+        Self::new(StatusCode::FORBIDDEN, m)
     }
     fn internal(m: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, m)

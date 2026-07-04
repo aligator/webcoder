@@ -1,0 +1,4 @@
+[alias]
+tauri-dev = "run -p xtask -- tauri-dev"
+tauri-build = "run -p xtask -- tauri-build"
+headless = "run -p xtask -- headless"

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Webcoder
+Comment=Local FFmpeg transcoder frontend
+Exec=webcoder-flatpak
+Icon=dev.webcoder.app
+Terminal=false
+Categories=AudioVideo;Video;Utility;

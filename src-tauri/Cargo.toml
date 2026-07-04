@@ -1,0 +1,26 @@
+[package]
+name = "webcoder-desktop"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "webcoder"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+async_zip = { version = "0.0.17", features = ["tokio"] }
+axum = { version = "0.7", features = ["multipart"] }
+base64 = "0.22"
+futures-lite = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "fs", "io-util", "time", "signal", "sync"] }
+tokio-util = { version = "0.7", features = ["io", "compat"] }
+tower-http = { version = "0.6", features = ["fs", "trace"] }
+uuid = { version = "1", features = ["v4"] }
+webcoder-frontend = { path = ".." }

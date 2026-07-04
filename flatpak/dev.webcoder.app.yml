@@ -1,0 +1,43 @@
+app-id: dev.webcoder.app
+runtime: org.freedesktop.Platform
+runtime-version: "24.08"
+sdk: org.freedesktop.Sdk
+command: webcoder-flatpak
+
+finish-args:
+  - --share=ipc
+  - --socket=fallback-x11
+  - --socket=wayland
+  - --device=dri
+  - --share=network
+  - --filesystem=xdg-download
+  - --talk-name=org.freedesktop.Flatpak
+
+build-options:
+  build-args:
+    - --share=network
+  env:
+    CARGO_HOME: /run/build/webcoder/cargo
+    RUSTUP_HOME: /run/build/webcoder/rustup
+    PATH: /run/build/webcoder/cargo/bin:/usr/bin:/bin
+
+modules:
+  - name: webcoder
+    buildsystem: simple
+    build-commands:
+      - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable --target wasm32-unknown-unknown
+      - cargo install trunk --locked
+      - trunk build
+      - cargo build --manifest-path src-tauri/Cargo.toml --release --locked --bin webcoder
+      - install -Dm755 target/release/webcoder /app/bin/webcoder
+      - install -Dm755 flatpak/webcoder-flatpak /app/bin/webcoder-flatpak
+      - install -Dm755 flatpak/ffmpeg-host /app/bin/ffmpeg
+      - install -Dm755 flatpak/ffmpeg-host /app/bin/ffprobe
+      - install -d /app/share/webcoder/dist
+      - cp -r dist/. /app/share/webcoder/dist/
+      - install -Dm644 flatpak/dev.webcoder.app.desktop /app/share/applications/dev.webcoder.app.desktop
+      - install -Dm644 flatpak/dev.webcoder.app.metainfo.xml /app/share/metainfo/dev.webcoder.app.metainfo.xml
+      - install -Dm644 src-tauri/icons/icon.png /app/share/icons/hicolor/32x32/apps/dev.webcoder.app.png
+    sources:
+      - type: dir
+        path: ..

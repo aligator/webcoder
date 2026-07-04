@@ -1,0 +1,5 @@
+#!/bin/sh
+export WEBCODER_DESKTOP_DIST=/app/share/webcoder/dist
+export WEBCODER_FFMPEG=/app/bin/ffmpeg
+export WEBCODER_FFPROBE=/app/bin/ffprobe
+exec /app/bin/webcoder "$@"

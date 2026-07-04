@@ -1,0 +1,26 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Webcoder",
+  "version": "0.1.0",
+  "identifier": "dev.webcoder.app",
+  "mainBinaryName": "webcoder",
+  "build": {
+    "beforeDevCommand": "trunk build",
+    "beforeBuildCommand": "trunk build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "resources": {
+      "../dist": "dist"
+    }
+  }
+}

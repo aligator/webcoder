@@ -1,29 +1,22 @@
 [package]
-name = "webcoder"
+name = "webcoder-frontend"
 version = "0.1.0"
 edition = "2024"
+
+[workspace]
+members = [".", "src-tauri", "xtask"]
+resolver = "3"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [[bin]]
-name = "webcoder"
-path = "src/main.rs"
+name = "webcoder-frontend"
+path = "frontend/src/main.rs"
 
-[[bin]]
-name = "server"
-path = "src/bin/server.rs"
-
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-axum = { version = "0.7", features = ["multipart"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "io-util", "time", "signal"] }
-tower-http = { version = "0.6", features = ["fs", "trace"] }
-tokio-util = { version = "0.7", features = ["io", "compat"] }
-uuid = { version = "1", features = ["v4"] }
-base64 = "0.22"
-async_zip = { version = "0.0.17", features = ["tokio"] }
-futures-lite = "2"
+[lib]
+path = "frontend/src/lib.rs"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 yew = { version = "0.21", features = ["csr"] }
@@ -32,6 +25,8 @@ wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 web-sys = { version = "0.3", features = [
   "Clipboard",
+  "DataTransfer",
+  "DragEvent",
   "Event",
   "File",
   "FileList",

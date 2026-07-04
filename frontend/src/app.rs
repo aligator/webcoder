@@ -10,7 +10,7 @@ use std::rc::Rc;
 use wasm_bindgen::JsValue;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
-use web_sys::{Event, File, HtmlInputElement, HtmlSelectElement, InputEvent};
+use web_sys::{DragEvent, Event, File, FileList, HtmlInputElement, HtmlSelectElement, InputEvent};
 use yew::TargetCast;
 use yew::prelude::*;
 
@@ -22,12 +22,33 @@ extern "C" {
     #[wasm_bindgen(catch, js_name = probeMedia)]
     async fn probe_media(file: File) -> Result<JsValue, JsValue>;
 
+    #[wasm_bindgen(catch, js_name = pickNativeFiles)]
+    async fn pick_native_files() -> Result<JsValue, JsValue>;
+
+    #[wasm_bindgen(catch, js_name = probeNativePath)]
+    async fn probe_native_path(path: String) -> Result<JsValue, JsValue>;
+
+    #[wasm_bindgen(js_name = nativeApp)]
+    fn native_app() -> bool;
+
+    #[wasm_bindgen(js_name = listenNativeDrop)]
+    fn listen_native_drop(callback: &JsValue);
+
     #[wasm_bindgen(catch, js_name = runEncode)]
     async fn run_encode(
         job_id: String,
         settings_json: String,
         tracks_json: String,
     ) -> Result<JsValue, JsValue>;
+
+    #[wasm_bindgen(js_name = withApiKey)]
+    fn with_api_key(url: &str) -> String;
+
+    #[wasm_bindgen(catch, js_name = saveOutput)]
+    async fn save_output(output_path: String, output_name: String) -> Result<JsValue, JsValue>;
+
+    #[wasm_bindgen(catch, js_name = saveAllOutputs)]
+    async fn save_all_outputs(items_json: String) -> Result<JsValue, JsValue>;
 }
 
 #[derive(Deserialize)]
@@ -43,6 +64,8 @@ struct ProbeResponse {
     #[allow(dead_code)]
     stream_count: usize,
     tracks: Vec<Track>,
+    file_name: Option<String>,
+    size_bytes: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -51,6 +74,7 @@ struct EncodeResponse {
     log: String,
     output_name: String,
     download_url: String,
+    output_path: Option<String>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -68,7 +92,21 @@ struct EncodeItem {
     status: EncodeStatus,
     log: String,
     download_url: String,
+    output_path: String,
     output_name: String,
+}
+
+/// One finished output to copy in a "Save all" batch, serialized to the bridge.
+#[derive(serde::Serialize)]
+struct SaveItem {
+    output_path: String,
+    output_name: String,
+}
+
+/// Result of a "Save all" batch: how many files were copied (0 = cancelled).
+#[derive(Deserialize)]
+struct SaveAllResult {
+    saved: usize,
 }
 
 /// Decode a JSON string returned by the api.js bridge into `T`.
@@ -105,6 +143,14 @@ impl Tab {
     ];
 }
 
+/// Which media column is shown on very small screens, where the two-column
+/// layout collapses to one column with a tab switch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MediaCol {
+    Tracks,
+    Files,
+}
+
 /// One encoder offered by the server's FFmpeg, from `ffmpeg -encoders`. Drives
 /// the per-track output dropdown so it lists only codecs the backend can run.
 #[derive(Clone, Debug, PartialEq)]
@@ -127,6 +173,33 @@ fn kind_from_str(value: &str) -> StreamKind {
 pub fn app() -> Html {
     let state = use_state(AppState::default);
     let tab = use_state(|| Tab::Media);
+    let media_col = use_state(|| MediaCol::Tracks);
+    let dragging = use_state(|| false);
+    // Transient snackbar message; auto-clears a few seconds after being set.
+    let toast = use_state(|| Option::<String>::None);
+    {
+        let toast = toast.clone();
+        use_effect_with((*toast).is_some(), move |shown| {
+            let handle = if *shown {
+                web_sys::window().and_then(|win| {
+                    let toast = toast.clone();
+                    let cb = Closure::once_into_js(move || toast.set(None));
+                    win.set_timeout_with_callback_and_timeout_and_arguments_0(
+                        cb.unchecked_ref(),
+                        3000,
+                    )
+                    .ok()
+                })
+            } else {
+                None
+            };
+            move || {
+                if let (Some(id), Some(win)) = (handle, web_sys::window()) {
+                    win.clear_timeout_with_handle(id);
+                }
+            }
+        });
+    }
     let copied = use_state(|| false);
     let show_command_preview = use_state(|| false);
     let job_log = use_state(|| "Server FFmpeg runtime idle.".to_owned());
@@ -136,6 +209,39 @@ pub fn app() -> Html {
     // Maps a local file id to the server-side job id returned by the probe
     // upload, so the encode request can reference the already-uploaded input.
     let job_ids = use_mut_ref(HashMap::<usize, String>::new);
+
+    // Mirror of the current AppState, kept fresh every render, so the
+    // long-lived native drag-drop listener can read the latest file list
+    // instead of the (frozen) state captured when it was registered.
+    let latest_state = use_mut_ref(AppState::default);
+    *latest_state.borrow_mut() = (*state).clone();
+
+    // Register the desktop (Tauri) OS drag-drop listener once. Browser DnD is
+    // handled by the drop zone's own DragEvent handlers.
+    {
+        let state = state.clone();
+        let job_ids = job_ids.clone();
+        let job_log = job_log.clone();
+        let latest_state = latest_state.clone();
+        use_effect_with((), move |_| {
+            let closure = Closure::wrap(Box::new(move |value: JsValue| {
+                let paths = js_sys::Array::from(&value)
+                    .iter()
+                    .filter_map(|entry| entry.as_string())
+                    .collect::<Vec<_>>();
+                let base = latest_state.borrow().clone();
+                ingest_native_paths(
+                    paths,
+                    base,
+                    state.clone(),
+                    job_ids.clone(),
+                    job_log.clone(),
+                );
+            }) as Box<dyn FnMut(JsValue)>);
+            listen_native_drop(closure.as_ref().unchecked_ref());
+            move || drop(closure)
+        });
+    }
 
     // Fetch the encoders the server's FFmpeg supports once on load so every
     // output dropdown lists only codecs the backend can actually run.
@@ -235,12 +341,13 @@ pub fn app() -> Html {
                 <section class={classes!("content-grid", (!*show_command_preview).then_some("preview-hidden"))}>
                     <div class="primary-pane">
                         { match *tab {
-                            Tab::Media => view_media(&state, &job_ids, &job_log, &browser_encoders),
+                            Tab::Media => view_media(&state, &media_col, &dragging, &job_ids, &job_log, &browser_encoders),
                             Tab::Convert => view_convert(&state),
                             Tab::Queue => view_queue(
                                 &state,
                                 &job_ids,
                                 &results,
+                                &toast,
                             ),
                         }}
                     </div>
@@ -269,6 +376,13 @@ pub fn app() -> Html {
                     }
                 </section>
             </section>
+            {
+                if let Some(message) = (*toast).clone() {
+                    html! { <div class="snackbar" role="status">{ message }</div> }
+                } else {
+                    Html::default()
+                }
+            }
         </main>
     }
 }
@@ -289,116 +403,269 @@ fn page_subtitle(tab: Tab) -> &'static str {
     }
 }
 
+/// Upload browser `File`s to the server and probe them, updating `state`
+/// optimistically. Shared by the file `<input>` and the drag-and-drop zone.
+fn ingest_web_files(
+    files: FileList,
+    state: UseStateHandle<AppState>,
+    job_ids: Rc<RefCell<HashMap<usize, String>>>,
+    job_log: UseStateHandle<String>,
+) {
+    // State captured now. Async probe callbacks rebuild the file list from this
+    // stable `base` (+ the shared track accumulator) rather than cloning the
+    // `state` handle, whose value is frozen at this render.
+    let base = (*state).clone();
+    let start = base.files.len();
+    let mut pending: Vec<(usize, MediaFile, File)> = Vec::new();
+    for index in 0..files.length() {
+        if let Some(file) = files.get(index) {
+            let id = start + pending.len() + 1;
+            let media = file_to_media(id, &file);
+            pending.push((id, media, file));
+        }
+    }
+    if pending.is_empty() {
+        return;
+    }
+
+    // Optimistic render so files appear immediately while probing.
+    let mut next = base.clone();
+    next.files
+        .extend(pending.iter().map(|(_, media, _)| media.clone()));
+    if next.selected_file.is_none() {
+        next.selected_file = pending.first().map(|(id, _, _)| *id);
+    }
+    state.set(next);
+    job_log.set("Uploading and probing media on the server...".into());
+
+    let base = Rc::new(base);
+    let pending_meta: Rc<Vec<(usize, MediaFile)>> =
+        Rc::new(pending.iter().map(|(id, m, _)| (*id, m.clone())).collect());
+    let acc: Rc<RefCell<HashMap<usize, Vec<Track>>>> = Rc::new(RefCell::new(HashMap::new()));
+
+    for (id, media, file) in pending {
+        let state = state.clone();
+        let job_log = job_log.clone();
+        let job_ids = job_ids.clone();
+        let base = base.clone();
+        let pending_meta = pending_meta.clone();
+        let acc = acc.clone();
+        let name = media.name.clone();
+        spawn_local(async move {
+            match probe_media(file).await {
+                Ok(result) => match parse_json::<ProbeResponse>(result) {
+                    Ok(probe) => {
+                        job_ids.borrow_mut().insert(id, probe.job_id);
+                        acc.borrow_mut().insert(id, probe.tracks);
+                        let mut next = (*base).clone();
+                        for (pid, pmeta) in pending_meta.iter() {
+                            let mut media = pmeta.clone();
+                            if let Some(tracks) = acc.borrow().get(pid) {
+                                media.tracks = tracks.clone();
+                            }
+                            next.files.push(media);
+                        }
+                        if next.selected_file.is_none() {
+                            next.selected_file = pending_meta.first().map(|(id, _)| *id);
+                        }
+                        state.set(next);
+                        job_log.set(format!("Loaded stream metadata for {name}."));
+                    }
+                    Err(error) => job_log.set(format!("Probe parse failed for {name}: {error}")),
+                },
+                Err(error) => {
+                    job_log.set(format!(
+                        "Server probe failed for {name}: {}",
+                        js_error_text(error)
+                    ));
+                }
+            }
+        });
+    }
+}
+
+/// Probe native file paths (desktop picker or OS drag-drop) with the backend
+/// FFmpeg. Shared by the "Open" button and the native drag-and-drop listener.
+fn ingest_native_paths(
+    paths: Vec<String>,
+    base: AppState,
+    state: UseStateHandle<AppState>,
+    job_ids: Rc<RefCell<HashMap<usize, String>>>,
+    job_log: UseStateHandle<String>,
+) {
+    if paths.is_empty() {
+        return;
+    }
+    spawn_local(async move {
+        job_log.set("Probing native files with FFmpeg...".into());
+        let mut next = base;
+        for path in paths {
+            let fallback_name = path
+                .rsplit(['/', '\\'])
+                .next()
+                .filter(|name| !name.is_empty())
+                .unwrap_or("media")
+                .to_owned();
+            match probe_native_path(path.clone()).await {
+                Ok(result) => match parse_json::<ProbeResponse>(result) {
+                    Ok(probe) => {
+                        let id = next.files.iter().map(|file| file.id).max().unwrap_or(0) + 1;
+                        let name = probe.file_name.unwrap_or(fallback_name);
+                        job_ids.borrow_mut().insert(id, probe.job_id);
+                        next.files.push(MediaFile {
+                            id,
+                            name: name.clone(),
+                            size_bytes: probe.size_bytes.unwrap_or(0),
+                            tracks: probe.tracks,
+                        });
+                        if next.selected_file.is_none() {
+                            next.selected_file = Some(id);
+                        }
+                        state.set(next.clone());
+                        job_log.set(format!("Loaded stream metadata for {name}."));
+                    }
+                    Err(error) => job_log.set(format!("Native probe parse failed: {error}")),
+                },
+                Err(error) => {
+                    job_log.set(format!(
+                        "Native probe failed for {fallback_name}: {}",
+                        js_error_text(error)
+                    ));
+                }
+            }
+        }
+    });
+}
+
 fn view_media(
     state: &UseStateHandle<AppState>,
+    media_col: &UseStateHandle<MediaCol>,
+    dragging: &UseStateHandle<bool>,
     job_ids: &Rc<RefCell<HashMap<usize, String>>>,
     job_log: &UseStateHandle<String>,
     browser_encoders: &UseStateHandle<Vec<BrowserEncoder>>,
 ) -> Html {
+    let is_native = native_app();
     let on_files = {
         let state = state.clone();
         let job_ids = job_ids.clone();
         let job_log = job_log.clone();
         Callback::from(move |event: Event| {
             let input: HtmlInputElement = event.target_unchecked_into();
-            let Some(files) = input.files() else {
-                return;
-            };
-
-            // State captured at this render. Async probe callbacks must rebuild
-            // the file list from this stable `base` (+ the shared track
-            // accumulator below) rather than cloning the `state` handle, whose
-            // value is frozen at this render — cloning it in an async task would
-            // clobber the optimistic insert and make files vanish on upload.
-            let base = (*state).clone();
-            let start = base.files.len();
-            let mut pending: Vec<(usize, MediaFile, File)> = Vec::new();
-            for index in 0..files.length() {
-                if let Some(file) = files.get(index) {
-                    let id = start + pending.len() + 1;
-                    let media = file_to_media(id, &file);
-                    pending.push((id, media, file));
-                }
-            }
-            if pending.is_empty() {
-                return;
-            }
-
-            // Optimistic render so files appear immediately while probing.
-            let mut next = base.clone();
-            next.files
-                .extend(pending.iter().map(|(_, media, _)| media.clone()));
-            if next.selected_file.is_none() {
-                next.selected_file = pending.first().map(|(id, _, _)| *id);
-            }
-            state.set(next);
-            job_log.set("Uploading and probing media on the server...".into());
-
-            let base = Rc::new(base);
-            let pending_meta: Rc<Vec<(usize, MediaFile)>> =
-                Rc::new(pending.iter().map(|(id, m, _)| (*id, m.clone())).collect());
-            let acc: Rc<RefCell<HashMap<usize, Vec<Track>>>> =
-                Rc::new(RefCell::new(HashMap::new()));
-
-            for (id, media, file) in pending {
-                let state = state.clone();
-                let job_log = job_log.clone();
-                let job_ids = job_ids.clone();
-                let base = base.clone();
-                let pending_meta = pending_meta.clone();
-                let acc = acc.clone();
-                let name = media.name.clone();
-                spawn_local(async move {
-                    match probe_media(file).await {
-                        Ok(result) => match parse_json::<ProbeResponse>(result) {
-                            Ok(probe) => {
-                                job_ids.borrow_mut().insert(id, probe.job_id);
-                                acc.borrow_mut().insert(id, probe.tracks);
-                                // Rebuild the authoritative file list from the
-                                // stable base plus whatever tracks have arrived.
-                                let mut next = (*base).clone();
-                                for (pid, pmeta) in pending_meta.iter() {
-                                    let mut media = pmeta.clone();
-                                    if let Some(tracks) = acc.borrow().get(pid) {
-                                        media.tracks = tracks.clone();
-                                    }
-                                    next.files.push(media);
-                                }
-                                if next.selected_file.is_none() {
-                                    next.selected_file = pending_meta.first().map(|(id, _)| *id);
-                                }
-                                state.set(next);
-                                job_log.set(format!("Loaded stream metadata for {name}."));
-                            }
-                            Err(error) => {
-                                job_log.set(format!("Probe parse failed for {name}: {error}"))
-                            }
-                        },
-                        Err(error) => {
-                            job_log.set(format!(
-                                "Server probe failed for {name}: {}",
-                                js_error_text(error)
-                            ));
-                        }
-                    }
-                });
+            if let Some(files) = input.files() {
+                ingest_web_files(files, state.clone(), job_ids.clone(), job_log.clone());
             }
         })
     };
+    let on_drop = {
+        let state = state.clone();
+        let job_ids = job_ids.clone();
+        let job_log = job_log.clone();
+        let dragging = dragging.clone();
+        Callback::from(move |event: DragEvent| {
+            event.prevent_default();
+            dragging.set(false);
+            if let Some(files) = event.data_transfer().and_then(|dt| dt.files()) {
+                ingest_web_files(files, state.clone(), job_ids.clone(), job_log.clone());
+            }
+        })
+    };
+    let on_drag_over = Callback::from(|event: DragEvent| event.prevent_default());
+    let on_drag_enter = {
+        let dragging = dragging.clone();
+        Callback::from(move |event: DragEvent| {
+            event.prevent_default();
+            dragging.set(true);
+        })
+    };
+    let on_drag_leave = {
+        let dragging = dragging.clone();
+        Callback::from(move |event: DragEvent| {
+            event.prevent_default();
+            dragging.set(false);
+        })
+    };
+    let on_native_files = {
+        let state = state.clone();
+        let job_ids = job_ids.clone();
+        let job_log = job_log.clone();
+        Callback::from(move |_| {
+            let state = state.clone();
+            let job_ids = job_ids.clone();
+            let job_log = job_log.clone();
+            let base = (*state).clone();
+            spawn_local(async move {
+                match pick_native_files().await {
+                    Ok(value) => match parse_json::<Vec<String>>(value) {
+                        Ok(paths) => ingest_native_paths(paths, base, state, job_ids, job_log),
+                        Err(error) => {
+                            job_log.set(format!("Native picker parse failed: {error}"))
+                        }
+                    },
+                    Err(error) => {
+                        job_log.set(format!("Native picker failed: {}", js_error_text(error)))
+                    }
+                }
+            });
+        })
+    };
+
+    let show_tracks = **media_col == MediaCol::Tracks;
+    let select_tracks = {
+        let media_col = media_col.clone();
+        Callback::from(move |_| media_col.set(MediaCol::Tracks))
+    };
+    let select_files = {
+        let media_col = media_col.clone();
+        Callback::from(move |_| media_col.set(MediaCol::Files))
+    };
 
     html! {
-        <div class="media-grid">
+        <div class={classes!("media-grid", if show_tracks { "show-tracks" } else { "show-files" })}>
+            <div class="media-col-tabs">
+                <button class={classes!("media-col-tab", show_tracks.then_some("active"))} onclick={select_tracks}>{"Tracks"}</button>
+                <button class={classes!("media-col-tab", (!show_tracks).then_some("active"))} onclick={select_files}>{"Files"}</button>
+            </div>
             <div class="media-main">
                 { view_tracks(state, browser_encoders) }
             </div>
             <aside class="media-files">
-                <section class="drop-zone">
-                    <input id="file-picker" type="file" multiple=true onchange={on_files} />
-                    <label for="file-picker">
-                        { icon("add") }
-                        <strong>{"Select media files"}</strong>
-                        <small>{"Files upload to the server and are probed with FFmpeg."}</small>
-                    </label>
+                <section
+                    class={classes!("drop-zone", dragging.then_some("dragging"))}
+                    ondragover={on_drag_over}
+                    ondragenter={on_drag_enter}
+                    ondragleave={on_drag_leave}
+                    ondrop={on_drop}
+                >
+                    <span class="drop-icon material-symbols-rounded">{"cloud_upload"}</span>
+                    <strong>{"Drop media here"}</strong>
+                    <small>{
+                        if is_native {
+                            "Drag files in, or browse your disk."
+                        } else {
+                            "Drag files in, or browse to upload & probe."
+                        }
+                    }</small>
+                    {
+                        if is_native {
+                            html! {
+                                <button class="command-button accent drop-cta" type="button" onclick={on_native_files}>
+                                    { icon("folder_open") }
+                                    { "Browse files" }
+                                </button>
+                            }
+                        } else {
+                            html! {
+                                <>
+                                    <input id="file-picker" class="visually-hidden" type="file" multiple=true onchange={on_files} />
+                                    <label class="command-button accent drop-cta" for="file-picker">
+                                        { icon("folder_open") }
+                                        { "Browse files" }
+                                    </label>
+                                </>
+                            }
+                        }
+                    }
                 </section>
 
                 <div class="file-toolbar">
@@ -648,12 +915,50 @@ fn view_queue(
     state: &UseStateHandle<AppState>,
     job_ids: &Rc<RefCell<HashMap<usize, String>>>,
     results: &UseStateHandle<Vec<EncodeItem>>,
+    toast: &UseStateHandle<Option<String>>,
 ) -> Html {
+    let is_native = native_app();
     let ready = state
         .files
         .iter()
         .filter(|file| job_ids.borrow().contains_key(&file.id))
         .count();
+
+    let save_all = {
+        let results = results.clone();
+        let toast = toast.clone();
+        Callback::from(move |_| {
+            let items: Vec<SaveItem> = results
+                .iter()
+                .filter(|item| item.status == EncodeStatus::Done && !item.output_path.is_empty())
+                .map(|item| SaveItem {
+                    output_path: item.output_path.clone(),
+                    output_name: item.output_name.clone(),
+                })
+                .collect();
+            if items.is_empty() {
+                return;
+            }
+            let Ok(payload) = serde_json::to_string(&items) else {
+                return;
+            };
+            let toast = toast.clone();
+            spawn_local(async move {
+                match save_all_outputs(payload).await {
+                    Ok(value) => match parse_json::<SaveAllResult>(value) {
+                        Ok(result) if result.saved > 0 => {
+                            toast.set(Some(format!("Copied {} files to the chosen folder.", result.saved)))
+                        }
+                        Ok(_) => {}
+                        Err(error) => toast.set(Some(format!("Save all failed: {error}"))),
+                    },
+                    Err(error) => {
+                        toast.set(Some(format!("Save all failed: {}", js_error_text(error))))
+                    }
+                }
+            });
+        })
+    };
 
     let run_batch = {
         let state = state.clone();
@@ -703,6 +1008,7 @@ fn view_queue(
                         status: EncodeStatus::Running,
                         log: String::new(),
                         download_url: String::new(),
+                        output_path: String::new(),
                         output_name: String::new(),
                     })
                     .collect();
@@ -721,6 +1027,7 @@ fn view_queue(
                                 items[index].log = response.log;
                                 items[index].output_name = response.output_name;
                                 items[index].download_url = response.download_url;
+                                items[index].output_path = response.output_path.unwrap_or_default();
                             }
                             Err(error) => {
                                 items[index].status = EncodeStatus::Failed;
@@ -771,13 +1078,20 @@ fn view_queue(
                         if results.is_empty() {
                             Html::default()
                         } else {
-                            let zip_link = if done_ids.len() > 1 {
-                                let href = format!("/api/zip?jobs={}", done_ids.join(","));
+                            let zip_link = if done_ids.len() > 1 && !is_native {
+                                let href = with_api_key(&format!("/api/zip?jobs={}", done_ids.join(",")));
                                 html! {
                                     <a class="command-button accent result-download" href={href} download="webcoder-batch.zip">
                                         { icon("folder_zip") }
                                         { "Download all" }
                                     </a>
+                                }
+                            } else if done_ids.len() > 1 && is_native {
+                                html! {
+                                    <button class="command-button accent result-download" type="button" onclick={save_all.clone()}>
+                                        { icon("folder") }
+                                        { "Save all" }
+                                    </button>
                                 }
                             } else {
                                 Html::default()
@@ -815,6 +1129,17 @@ fn view_result_row(item: &EncodeItem) -> Html {
         EncodeStatus::Failed => ("error", "Failed", "is-failed"),
     };
     let open = item.status == EncodeStatus::Failed;
+    let save_native = {
+        let output_path = item.output_path.clone();
+        let output_name = item.output_name.clone();
+        Callback::from(move |_| {
+            let output_path = output_path.clone();
+            let output_name = output_name.clone();
+            spawn_local(async move {
+                let _ = save_output(output_path, output_name).await;
+            });
+        })
+    };
     html! {
         <div class={classes!("result-card", status_class)}>
             <div class="result-head">
@@ -822,7 +1147,14 @@ fn view_result_row(item: &EncodeItem) -> Html {
                 <strong>{&item.name}</strong>
                 <span class="result-status">{label}</span>
                 {
-                    if !item.download_url.is_empty() {
+                    if !item.output_path.is_empty() {
+                        html! {
+                            <button class="command-button accent result-download" type="button" onclick={save_native}>
+                                { icon("download") }
+                                { "Save" }
+                            </button>
+                        }
+                    } else if !item.download_url.is_empty() {
                         html! {
                             <a class="command-button accent result-download" href={item.download_url.clone()} download={item.output_name.clone()}>
                                 { icon("download") }

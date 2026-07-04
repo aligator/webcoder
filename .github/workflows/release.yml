@@ -6,7 +6,7 @@ on:
       - "v*"
 
 permissions:
-  contents: read
+  contents: write
   packages: write # push to GHCR
 
 env:
@@ -50,3 +50,64 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  tauri:
+    name: build Tauri Linux bundles
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            src-tauri -> target
+
+      - name: Install Linux and Tauri prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            xdg-utils \
+            ffmpeg
+
+      - name: Install Trunk and Tauri CLI
+        run: |
+          cargo install trunk --locked
+          cargo install tauri-cli --version "^2" --locked
+
+      - name: Build Tauri desktop
+        run: cargo tauri-build
+
+      - name: Upload Tauri bundles to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/release/bundle/**/*
+
+  flatpak:
+    name: build Flatpak bundle
+    runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-24.08
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: webcoder.flatpak
+          manifest-path: flatpak/dev.webcoder.app.yml
+          cache-key: flatpak-builder-${{ github.sha }}
+          verbose: true
+
+      - name: Upload Flatpak bundle to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: webcoder.flatpak

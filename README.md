@@ -25,13 +25,14 @@ browser-only WASM build.
 ## Security model
 
 FFmpeg on a server is a powerful primitive, so the backend is deliberately
-constrained (see [`src/server.rs`](src/server.rs)):
+constrained (see [`src-tauri/src/server.rs`](src-tauri/src/server.rs)):
 
 - **No shell.** FFmpeg is spawned with an explicit `argv` vector — no
   word-splitting, no injection.
 - **No free-form arguments.** There is no "custom args" field. The entire
   command line is rebuilt from validated, typed settings
-  ([`core::validate_job`](src/core.rs) + [`core::build_args`](src/core.rs)).
+  ([`core::validate_job`](frontend/src/core.rs) +
+  [`core::build_args`](frontend/src/core.rs)).
 - **Path control.** Input/output paths are chosen by the server inside a
   throwaway per-job directory; client filenames only contribute a sanitized
   extension. No traversal or absolute-path escape.
@@ -67,18 +68,80 @@ Requires the Rust toolchain, [Trunk](https://trunkrs.dev/), and `ffmpeg` +
 rustup target add wasm32-unknown-unknown
 cargo install trunk
 
-trunk build            # build the frontend into ./dist
-cargo run --bin server # start the backend (serves ./dist + the API)
+trunk build                                      # build frontend crate into ./dist
+cargo headless
 # open http://localhost:8080
 ```
 
-The project builds two binaries: `server` (native backend) and `webcoder` (the
-Yew app, compiled to WASM by Trunk). `cargo test` covers the command builder in
-[`src/core.rs`](src/core.rs).
+The workspace has two app projects:
+
+- root `webcoder-frontend`: Yew/WASM frontend plus shared conversion core in
+  `frontend/src`
+- `src-tauri` `webcoder-desktop`: one native app binary (`webcoder`) containing
+  both Tauri desktop and `--headless` server modes
+
+`cargo test -p webcoder-frontend` covers the command builder in
+[`frontend/src/core.rs`](frontend/src/core.rs).
+
+## App modes
+
+`webcoder` is one app with two modes:
+
+- default: Tauri desktop shell
+- `--headless`: HTTP server only, for Docker/self-hosting
+
+In desktop mode the UI exposes a native file picker. Picked files are probed
+and encoded by path on the local machine, so they do not upload/copy into the
+backend workdir first. Browser/headless mode keeps the upload-based HTTP API.
+
+Root cargo aliases build the frontend automatically:
+
+- `cargo tauri-dev`
+- `cargo tauri-build`
+- `cargo headless`
+
+The server and Tauri desktop shell live in the same native project:
+`src-tauri`. The WASM frontend is the separate root frontend project.
+`src-tauri/src/main.rs` stays as a thin entry point and the app setup lives in
+`src-tauri/src/lib.rs`.
+
+Requires the Rust toolchain, Trunk, Tauri system prerequisites, and `ffmpeg` +
+`ffprobe` on `PATH`.
+
+```sh
+cargo install tauri-cli --version "^2"
+cargo tauri-dev
+
+# production bundle/installers
+cargo tauri-build
+
+# headless server mode
+cargo headless
+```
+
+## Flatpak
+
+The Flatpak manifest lives at
+[`flatpak/dev.webcoder.app.yml`](flatpak/dev.webcoder.app.yml). It builds the
+Tauri desktop app and installs small wrappers that call the host `ffmpeg` and
+`ffprobe` via `flatpak-spawn`, so the Flatpak still expects FFmpeg to be
+installed on the host.
+
+```sh
+flatpak-builder --force-clean --user --install build-dir flatpak/dev.webcoder.app.yml
+flatpak run dev.webcoder.app
+```
+
+## CI/CD
+
+[`ci.yml`](.github/workflows/ci.yml) checks the native app, WASM frontend,
+Tauri Linux bundle and Flatpak bundle on pushes and pull requests.
+[`release.yml`](.github/workflows/release.yml) runs on `v*` tags and publishes
+the Docker image, Tauri Linux bundles and `webcoder.flatpak`.
 
 ## Docker
 
-The multi-stage `Dockerfile` builds the WASM frontend and the native server,
+The multi-stage `Dockerfile` builds the WASM frontend and the native app,
 then produces a `debian`-based runtime image with `ffmpeg` installed, running as
 an unprivileged user on port 8080.
 

@@ -1,6 +1,6 @@
 #[cfg(target_arch = "wasm32")]
 fn main() {
-    yew::Renderer::<webcoder::app::App>::new().render();
+    yew::Renderer::<webcoder_frontend::app::App>::new().render();
 }
 
 #[cfg(not(target_arch = "wasm32"))]

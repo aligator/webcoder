@@ -63,6 +63,33 @@ button {
   grid-template-columns: 236px minmax(0, 1fr);
 }
 
+.snackbar {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  transform: translateX(-50%);
+  z-index: 50;
+  max-width: min(90vw, 460px);
+  padding: 12px 18px;
+  border-radius: 10px;
+  background: #192126;
+  color: #eef7f5;
+  font-weight: 600;
+  box-shadow: 0 12px 40px rgba(23, 32, 38, 0.35);
+  animation: snackbar-in 0.18s ease;
+}
+
+@keyframes snackbar-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, 12px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+}
+
 .side-rail {
   min-height: 100vh;
   overflow-y: auto;
@@ -226,12 +253,63 @@ label span,
 /* Media page: track selector on the left, uploaded-files panel on the right.
    Each column scrolls independently; the page itself never scrolls. */
 .media-grid {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(260px, 320px);
-  gap: 16px;
+  display: flex;
+  gap: 10px;
   align-items: stretch;
   height: 100%;
   min-height: 0;
+}
+
+.media-grid > .media-main {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.media-grid > .media-files {
+  flex: 0 0 300px;
+  min-width: 0;
+}
+
+/* Column tabs only appear on very small screens (see media query below). */
+.media-col-tabs {
+  display: none;
+  gap: 8px;
+}
+
+.media-col-tab {
+  flex: 1 1 0;
+  min-height: 40px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: inherit;
+  font-weight: 700;
+}
+
+.media-col-tab.active {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+
+/* Media page: drop the outer card so each column is its own uniform box. */
+.primary-pane:has(.media-grid) {
+  border: 0;
+  box-shadow: none;
+  background: transparent;
+  padding: 0;
+}
+
+/* Left = streams box, right = files box. Same surface/border/radius/shadow,
+   separated by the grid gap. */
+.media-main,
+.media-files {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+  padding: 16px;
+  box-sizing: border-box;
 }
 
 .media-main {
@@ -245,6 +323,7 @@ label span,
 .media-main > .stack {
   flex: 1 1 auto;
   min-height: 0;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
 }
@@ -283,6 +362,11 @@ label span,
   flex: 0 0 auto;
 }
 
+/* Inside the files box, file rows are flat (no nested card look). */
+.media-files .file-row {
+  box-shadow: none;
+}
+
 .media-files .drop-zone {
   min-height: 150px;
 }
@@ -299,7 +383,30 @@ label span,
 
 @media (max-width: 900px) {
   .media-grid {
-    grid-template-columns: minmax(0, 1fr);
+    flex-direction: column;
+  }
+
+  .media-grid > .media-files {
+    flex: 0 0 auto;
+  }
+}
+
+/* Very small: collapse to one column, switch with tabs. */
+@media (max-width: 560px) {
+  .media-col-tabs {
+    display: flex;
+    flex: 0 0 auto;
+  }
+
+  .media-grid.show-tracks > .media-files,
+  .media-grid.show-files > .media-main {
+    display: none;
+  }
+
+  .media-grid > .media-main,
+  .media-grid > .media-files {
+    flex: 1 1 auto;
+    min-height: 0;
   }
 }
 
@@ -336,37 +443,96 @@ label span,
   gap: 14px;
 }
 
+/* Unified drop zone: identical in browser and desktop shells. */
 .drop-zone {
-  min-height: 220px;
-  display: grid;
-  place-items: center;
-  background:
-    linear-gradient(135deg, rgba(12, 122, 117, 0.08), transparent 45%),
-    var(--surface);
-}
-
-.drop-zone input {
-  position: absolute;
-  inline-size: 1px;
-  block-size: 1px;
-  opacity: 0;
-}
-
-.drop-zone label {
-  display: grid;
-  justify-items: center;
-  gap: 10px;
+  position: relative;
+  isolation: isolate;
+  min-height: 180px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 22px;
   text-align: center;
-  padding: 24px;
+  border: 2px dashed var(--line);
+  border-radius: 12px;
+  box-shadow: none;
+  background:
+    radial-gradient(120% 120% at 50% 0%, rgba(12, 122, 117, 0.08), transparent 60%),
+    var(--surface);
+  transition: border-color 0.15s ease;
 }
 
-.drop-zone label span {
-  background: var(--accent);
-  color: white;
+/* Drag emphasis via a fading overlay. Animating opacity interpolates smoothly;
+   transitioning the radial-gradient itself can't (its stops don't interpolate),
+   which is what caused the brief round flash on drag start. */
+.drop-zone::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  border-radius: inherit;
+  background: radial-gradient(120% 120% at 50% 0%, rgba(12, 122, 117, 0.22), transparent 60%);
+  opacity: 0;
+  transition: opacity 0.15s ease;
+  pointer-events: none;
+}
+
+.drop-zone.dragging {
+  border-color: var(--accent);
+}
+
+.drop-zone.dragging::before {
+  opacity: 1;
+}
+
+/* Root cause: the icon/text/button are drag-event targets, so moving the
+   pointer onto them fires dragleave on the zone and drops the highlight. While
+   dragging, take the children out of hit-testing so every drag event lands on
+   the zone itself. (Only during drag, so the button stays clickable normally.) */
+.drop-zone.dragging * {
+  pointer-events: none;
+}
+
+.drop-icon {
+  font-size: 44px;
+  line-height: 1;
+  color: var(--accent);
 }
 
 .drop-zone strong {
-  font-size: 1.45rem;
+  font-size: 1.1rem;
+}
+
+.drop-zone small {
+  color: var(--muted);
+}
+
+.drop-cta {
+  margin-top: 6px;
+}
+
+/* Neutralize the generic 42px icon-token sizing for the CTA icon. */
+.drop-cta .material-symbols-rounded {
+  width: auto;
+  height: auto;
+  background: transparent;
+  border-radius: 0;
+  font-size: 20px;
+  color: inherit;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 .file-list {
@@ -724,7 +890,7 @@ button:focus-visible {
   font-size: 0.82rem;
 }
 
-a.result-download {
+.result-download {
   margin-left: auto;
   min-height: 36px;
   display: inline-flex;
@@ -737,7 +903,7 @@ a.result-download {
   text-decoration: none;
 }
 
-a.result-download .material-symbols-rounded {
+.result-download .material-symbols-rounded {
   font-size: 18px;
 }
 
@@ -791,10 +957,15 @@ a.result-download .material-symbols-rounded {
   padding: 8px 12px;
   background: var(--surface-2);
   color: var(--ink);
+  font: inherit;
   font-weight: 700;
   text-decoration: none;
-  display: inline-grid;
-  place-items: center;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  box-sizing: border-box;
+  cursor: pointer;
 }
 
 .command-button.accent {
@@ -877,9 +1048,6 @@ a.result-download .material-symbols-rounded {
     grid-template-columns: auto 1fr auto;
     grid-template-rows: auto;
     align-items: center;
-    position: sticky;
-    top: 0;
-    z-index: 5;
   }
 
   .tab-list {
