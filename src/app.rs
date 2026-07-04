@@ -1,7 +1,7 @@
 use crate::core::{
-    AppState, CHAPTERS_COPY, CHAPTERS_STRIP, ConvertSettings, METADATA_COPY, METADATA_STRIP_ALL,
-    METADATA_STRIP_KEEP_TRACKS, MediaFile, QualityMode, StreamKind, Track, TrackOutput,
-    command_preview, format_size,
+    ALLOWED_CONTAINERS, AppState, CHAPTERS_COPY, CHAPTERS_STRIP, ConvertSettings, METADATA_COPY,
+    METADATA_STRIP_ALL, METADATA_STRIP_KEEP_TRACKS, MediaFile, QualityMode, StreamKind, Track,
+    TrackOutput, command_preview, format_size,
 };
 use serde::Deserialize;
 use std::cell::RefCell;
@@ -568,7 +568,7 @@ fn view_convert(state: &UseStateHandle<AppState>) -> Html {
         <div class="settings-grid">
             <section class="settings-group">
                 <div class="panel-title">{ icon("output") }<h2>{"Output"}</h2></div>
-                { select_field("Container", settings.container.clone(), &["mkv", "mp4", "mov", "webm", "gif"], update_convert_select(state, |settings, value| settings.container = value)) }
+                { select_field("Container", settings.container.clone(), ALLOWED_CONTAINERS, update_convert_select(state, |settings, value| settings.container = value)) }
                 { select_field("Preset", settings.preset.clone(), &["ultrafast", "veryfast", "fast", "medium", "slow", "slower"], update_convert_select(state, |settings, value| settings.preset = value)) }
                 { select_field("Color Format", settings.color_format.clone(), &["source", "yuv420p", "yuv420p10le", "yuv444p", "rgb24"], update_convert_select(state, |settings, value| settings.color_format = value)) }
             </section>
@@ -970,8 +970,26 @@ fn encoder_options(
         <>
             { option_selected("Copy", selected_label == "Copy") }
             { option_selected("Strip", selected_label == "Strip") }
-            { for names.iter().map(|name| option_selected(name, *name == selected_label)) }
+            { for names.iter().map(|name| encoder_option(name, *name == selected_label)) }
         </>
+    }
+}
+
+fn encoder_option(name: &str, selected: bool) -> Html {
+    html! {
+        <option value={name.to_owned()} selected={selected}>{friendly_encoder_name(name)}</option>
+    }
+}
+
+fn friendly_encoder_name(name: &str) -> &str {
+    match name {
+        "libmp3lame" => "MP3 (libmp3lame)",
+        "aac" => "AAC / M4A (aac)",
+        "libopus" => "Opus (libopus)",
+        "opus" => "Opus (opus)",
+        "flac" => "FLAC (flac)",
+        "pcm_s16le" => "WAV PCM 16-bit (pcm_s16le)",
+        _ => name,
     }
 }
 

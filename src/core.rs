@@ -232,16 +232,23 @@ pub fn build_args(
     quoted: bool,
 ) -> Vec<String> {
     let mut args = vec!["-hide_banner".to_owned(), "-y".to_owned()];
+    let has_video_output = tracks
+        .iter()
+        .any(|track| should_output_track(settings, track) && track.kind == StreamKind::Video);
+    let has_audio_output = tracks
+        .iter()
+        .any(|track| should_output_track(settings, track) && track.kind == StreamKind::Audio);
 
     args.extend(["-i".to_owned(), path_arg(input, quoted)]);
 
     let write_track_metadata =
         settings.apply_track_metadata && settings.metadata_mode != METADATA_STRIP_ALL;
-    for track in tracks.iter().filter(|track| track.enabled) {
-        if track.choice != TrackOutput::Strip {
-            args.push("-map".into());
-            args.push(format!("0:{}?", track.source_index));
-        }
+    for track in tracks
+        .iter()
+        .filter(|track| should_output_track(settings, track))
+    {
+        args.push("-map".into());
+        args.push(format!("0:{}?", track.source_index));
     }
 
     // Some bundled encoders are flagged experimental by the WASM core (e.g. the
@@ -249,7 +256,7 @@ pub fn build_args(
     // is relaxed, so enable it when such an encoder is selected.
     let needs_experimental = tracks
         .iter()
-        .filter(|track| track.enabled)
+        .filter(|track| should_output_track(settings, track))
         .any(|track| matches!(track.choice.ffmpeg_codec(), Some("opus" | "vorbis")));
     if needs_experimental {
         args.push("-strict".into());
@@ -259,11 +266,10 @@ pub fn build_args(
     let mut output_index = 0usize;
     let mut per_type_index: std::collections::HashMap<&str, usize> =
         std::collections::HashMap::new();
-    for track in tracks.iter().filter(|track| track.enabled) {
-        if track.choice == TrackOutput::Strip {
-            continue;
-        }
-
+    for track in tracks
+        .iter()
+        .filter(|track| should_output_track(settings, track))
+    {
         // Absolute output stream index for `-metadata:s:N`, and a per-kind index
         // for `-c:<type>:N` — the two use different numbering schemes.
         let stream_id = output_index;
@@ -291,13 +297,23 @@ pub fn build_args(
         }
     }
 
-    append_quality_args(&mut args, settings);
-    append_video_filter_args(&mut args, settings, input, quoted);
-    append_audio_args(&mut args, settings);
+    if has_video_output {
+        append_quality_args(&mut args, settings);
+        append_video_filter_args(&mut args, settings, input, quoted);
+    }
+    if has_audio_output {
+        append_audio_args(&mut args, settings);
+    }
 
     append_metadata_args(&mut args, settings);
     args.push(path_arg(output, quoted));
     args
+}
+
+fn should_output_track(settings: &ConvertSettings, track: &Track) -> bool {
+    track.enabled
+        && track.choice != TrackOutput::Strip
+        && (!is_audio_only_container(&settings.container) || track.kind == StreamKind::Audio)
 }
 
 fn append_quality_args(args: &mut Vec<String>, settings: &ConvertSettings) {
@@ -404,7 +420,10 @@ fn path_arg(path: &str, quoted: bool) -> String {
 
 /// Output containers the server is willing to mux into. Anything else is
 /// rejected before an FFmpeg process is ever spawned.
-pub const ALLOWED_CONTAINERS: &[&str] = &["mkv", "mp4", "mov", "webm", "gif"];
+pub const ALLOWED_CONTAINERS: &[&str] = &[
+    "mkv", "mp4", "mov", "webm", "gif", "mp3", "m4a", "opus", "flac", "wav",
+];
+const AUDIO_ONLY_CONTAINERS: &[&str] = &["mp3", "m4a", "opus", "flac", "wav"];
 const ALLOWED_PRESETS: &[&str] = &["ultrafast", "veryfast", "fast", "medium", "slow", "slower"];
 const ALLOWED_PIXEL_FORMATS: &[&str] = &["source", "yuv420p", "yuv420p10le", "yuv444p", "rgb24"];
 const ALLOWED_CROP_MODES: &[&str] = &["Disable", "Manual"];
@@ -415,6 +434,33 @@ const ALLOWED_METADATA_MODES: &[&str] = &[
     METADATA_STRIP_ALL,
 ];
 const ALLOWED_CHAPTER_MODES: &[&str] = &[CHAPTERS_COPY, CHAPTERS_STRIP];
+
+pub fn is_audio_only_container(container: &str) -> bool {
+    AUDIO_ONLY_CONTAINERS.contains(&container)
+}
+
+fn audio_copy_compatible(container: &str, codec: &str) -> bool {
+    let codec = codec.to_ascii_lowercase();
+    match container {
+        "mp3" => codec.contains("mp3"),
+        "m4a" => codec.contains("aac") || codec.contains("alac") || codec.contains("mp3"),
+        "opus" => codec.contains("opus"),
+        "flac" => codec.contains("flac"),
+        "wav" => codec.contains("pcm"),
+        _ => true,
+    }
+}
+
+fn recommended_audio_encoder(container: &str) -> &'static str {
+    match container {
+        "mp3" => "MP3 (libmp3lame)",
+        "m4a" => "AAC / M4A (aac)",
+        "opus" => "Opus (libopus)",
+        "flac" => "FLAC (flac)",
+        "wav" => "WAV PCM 16-bit (pcm_s16le)",
+        _ => "an encoder matching the output container",
+    }
+}
 
 /// Reduce an arbitrary user string to a safe file stem: ASCII alphanumerics,
 /// dash, underscore and dot only, never empty, length-capped. Used so the
@@ -514,9 +560,23 @@ pub fn validate_job(
         return Err("Unsupported audio channel value.".into());
     }
 
-    let mut enabled = 0usize;
+    let mut output_tracks = 0usize;
     for track in tracks.iter().filter(|track| track.enabled) {
-        enabled += 1;
+        if should_output_track(settings, track) {
+            output_tracks += 1;
+            if is_audio_only_container(&settings.container)
+                && track.kind == StreamKind::Audio
+                && track.choice == TrackOutput::Copy
+                && !audio_copy_compatible(&settings.container, &track.codec)
+            {
+                return Err(format!(
+                    "{} output cannot copy {} audio. Select {} for the audio track.",
+                    settings.container.to_uppercase(),
+                    track.codec,
+                    recommended_audio_encoder(&settings.container)
+                ));
+            }
+        }
         if track.source_index >= stream_count {
             return Err(format!(
                 "Track references stream {} but the input has {stream_count} streams.",
@@ -538,7 +598,7 @@ pub fn validate_job(
             return Err("Track title contains invalid characters.".into());
         }
     }
-    if enabled == 0 {
+    if output_tracks == 0 {
         return Err("No enabled tracks to encode.".into());
     }
     Ok(())
@@ -682,5 +742,71 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error, "Unsupported crop mode.");
+    }
+
+    #[test]
+    fn audio_only_container_maps_audio_tracks_only() {
+        let mut state = media_state();
+        state.convert.container = "mp3".into();
+
+        let args = build_ffmpeg_args(&state, state.selected_file().unwrap(), false);
+        assert!(!args.windows(2).any(|pair| pair == ["-map", "0:0?"]));
+        assert!(args.windows(2).any(|pair| pair == ["-map", "0:1?"]));
+        assert!(!args.windows(2).any(|pair| pair == ["-map", "0:2?"]));
+        assert!(!args.iter().any(|arg| arg == "-crf"));
+        assert!(!args.iter().any(|arg| arg == "-vf"));
+        assert!(args.windows(2).any(|pair| pair == ["-b:a", "160k"]));
+    }
+
+    #[test]
+    fn audio_only_container_requires_audio_output() {
+        let mut state = media_state();
+        state.convert.container = "flac".into();
+        for track in &mut state.files[0].tracks {
+            if track.kind == StreamKind::Audio {
+                track.enabled = false;
+            }
+        }
+        let encoders = ["libsvtav1", "libopus", "srt"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+
+        let error = validate_job(
+            &state.convert,
+            &state.selected_file().unwrap().tracks,
+            3,
+            &encoders,
+        )
+        .unwrap_err();
+        assert_eq!(error, "No enabled tracks to encode.");
+    }
+
+    #[test]
+    fn audio_only_container_rejects_incompatible_copy() {
+        let mut state = media_state();
+        state.convert.container = "mp3".into();
+        for track in &mut state.files[0].tracks {
+            if track.kind == StreamKind::Audio {
+                track.codec = "opus".into();
+                track.choice = TrackOutput::Copy;
+            }
+        }
+        let encoders = ["libsvtav1", "libopus", "srt"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+
+        let error = validate_job(
+            &state.convert,
+            &state.selected_file().unwrap().tracks,
+            3,
+            &encoders,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "MP3 output cannot copy opus audio. Select MP3 (libmp3lame) for the audio track."
+        );
     }
 }
