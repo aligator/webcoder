@@ -11,7 +11,6 @@ finish-args:
   - --device=dri
   - --share=network
   - --filesystem=xdg-download
-  - --talk-name=org.freedesktop.Flatpak
 
 build-options:
   build-args:
@@ -22,6 +21,72 @@ build-options:
     PATH: /run/build/webcoder/cargo/bin:/usr/bin:/bin
 
 modules:
+  # FFmpeg and its codec libraries are built from source and bundled, so the
+  # app is self-contained (no host FFmpeg, no flatpak-spawn).
+  - name: x264
+    buildsystem: simple
+    build-commands:
+      - ./configure --prefix=/app --enable-shared --disable-cli --enable-pic
+      - make -j$(nproc)
+      - make install
+    sources:
+      - type: git
+        url: https://code.videolan.org/videolan/x264.git
+        commit: b35605ace3ddf7c1a5d67a2eb553f034aef41d55
+
+  - name: x265
+    buildsystem: cmake-ninja
+    subdir: source
+    config-opts:
+      - -DENABLE_CLI=OFF
+    sources:
+      - type: archive
+        url: https://bitbucket.org/multicoreware/x265_git/downloads/x265_4.0.tar.gz
+        sha256: 75b4d05629e365913de3100b38a459b04e2a217a8f30efaa91b572d8e6d71282
+
+  - name: libvpx
+    buildsystem: simple
+    build-commands:
+      - ./configure --prefix=/app --enable-shared --disable-static --disable-examples --disable-tools --disable-docs --enable-vp8 --enable-vp9 --enable-pic
+      - make -j$(nproc)
+      - make install
+    sources:
+      - type: archive
+        url: https://github.com/webmproject/libvpx/archive/refs/tags/v1.14.1.tar.gz
+        sha256: 901747254d80a7937c933d03bd7c5d41e8e6c883e0665fadcb172542167c7977
+
+  - name: opus
+    buildsystem: autotools
+    config-opts:
+      - --disable-static
+    sources:
+      - type: archive
+        url: https://downloads.xiph.org/releases/opus/opus-1.5.2.tar.gz
+        sha256: 65c1d2f78b9f2fb20082c38cbe47c951ad5839345876e46941612ee87f9a7ce1
+
+  - name: lame
+    buildsystem: autotools
+    config-opts:
+      - --disable-static
+      - --disable-frontend
+    sources:
+      - type: archive
+        url: https://downloads.sourceforge.net/project/lame/lame/3.100/lame-3.100.tar.gz
+        sha256: ddfe36cab873794038ae2c1210557ad34857a4b6bdc515785d1da9e175b1da1e
+
+  - name: ffmpeg
+    buildsystem: simple
+    build-commands:
+      - ./configure --prefix=/app --enable-shared --disable-static --enable-gpl
+        --enable-version3 --enable-libx264 --enable-libx265 --enable-libvpx
+        --enable-libopus --enable-libmp3lame --disable-doc --disable-debug
+      - make -j$(nproc)
+      - make install
+    sources:
+      - type: archive
+        url: https://ffmpeg.org/releases/ffmpeg-7.1.tar.xz
+        sha256: 40973d44970dbc83ef302b0609f2e74982be2d85916dd2ee7472d30678a7abe6
+
   - name: webcoder
     buildsystem: simple
     build-commands:
@@ -31,8 +96,6 @@ modules:
       - cargo build --manifest-path src-tauri/Cargo.toml --release --locked --bin webcoder
       - install -Dm755 target/release/webcoder /app/bin/webcoder
       - install -Dm755 flatpak/webcoder-flatpak /app/bin/webcoder-flatpak
-      - install -Dm755 flatpak/ffmpeg-host /app/bin/ffmpeg
-      - install -Dm755 flatpak/ffmpeg-host /app/bin/ffprobe
       - install -d /app/share/webcoder/dist
       - cp -r dist/. /app/share/webcoder/dist/
       - install -Dm644 flatpak/dev.webcoder.app.desktop /app/share/applications/dev.webcoder.app.desktop

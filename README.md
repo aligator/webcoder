@@ -128,6 +128,8 @@ Tauri desktop app and installs small wrappers that call the host `ffmpeg` and
 installed on the host.
 
 ```sh
+flatpak install -y flathub org.freedesktop.Platform//24.08 org.freedesktop.Sdk//24.08
+
 flatpak-builder --force-clean --user --install build-dir flatpak/dev.webcoder.app.yml
 flatpak run dev.webcoder.app
 ```
