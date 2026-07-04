@@ -50,115 +50,39 @@ impl StreamKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CodecChoice {
+/// A track's output disposition. `Encoder` holds a raw FFmpeg encoder name
+/// (e.g. `libx264`) taken directly from the bundled WASM core's `-encoders`
+/// list — nothing is hardcoded, so the dropdown always reflects what the
+/// browser build can actually run.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TrackOutput {
     Copy,
     Strip,
-    H264X264,
-    H264Nvenc,
-    H265X265,
-    H265Nvenc,
-    Vp9,
-    Av1Svt,
-    Av1Aom,
-    Aac,
-    Opus,
-    Vorbis,
-    Eac3,
-    Mp3,
-    Flac,
-    MovText,
-    Srt,
-    WebVtt,
-    PngSequence,
-    JpegSequence,
-    Gif,
+    Encoder(String),
 }
 
-impl CodecChoice {
-    pub const VIDEO: &'static [Self] = &[
-        Self::Copy,
-        Self::Strip,
-        Self::H264X264,
-        Self::H264Nvenc,
-        Self::H265X265,
-        Self::H265Nvenc,
-        Self::Vp9,
-        Self::Av1Svt,
-        Self::Av1Aom,
-        Self::PngSequence,
-        Self::JpegSequence,
-        Self::Gif,
-    ];
-
-    pub const AUDIO: &'static [Self] = &[
-        Self::Copy,
-        Self::Strip,
-        Self::Aac,
-        Self::Opus,
-        Self::Vorbis,
-        Self::Eac3,
-        Self::Mp3,
-        Self::Flac,
-    ];
-
-    pub const SUBTITLE: &'static [Self] = &[
-        Self::Copy,
-        Self::Strip,
-        Self::MovText,
-        Self::Srt,
-        Self::WebVtt,
-    ];
-
-    pub fn label(self) -> &'static str {
+impl TrackOutput {
+    pub fn label(&self) -> &str {
         match self {
             Self::Copy => "Copy",
             Self::Strip => "Strip",
-            Self::H264X264 => "H.264 (x264)",
-            Self::H264Nvenc => "H.264 (NVENC)",
-            Self::H265X265 => "H.265 (x265)",
-            Self::H265Nvenc => "H.265 (NVENC)",
-            Self::Vp9 => "VP9",
-            Self::Av1Svt => "AV1 (SVT-AV1)",
-            Self::Av1Aom => "AV1 (AOM)",
-            Self::Aac => "AAC",
-            Self::Opus => "Opus",
-            Self::Vorbis => "Vorbis",
-            Self::Eac3 => "E-AC-3",
-            Self::Mp3 => "MP3",
-            Self::Flac => "FLAC",
-            Self::MovText => "Mov_Text",
-            Self::Srt => "SRT",
-            Self::WebVtt => "WebVTT",
-            Self::PngSequence => "PNG sequence",
-            Self::JpegSequence => "JPEG sequence",
-            Self::Gif => "Animated GIF",
+            Self::Encoder(name) => name,
         }
     }
 
-    pub fn ffmpeg_codec(self) -> Option<&'static str> {
+    pub fn from_label(value: &str) -> Self {
+        match value {
+            "Copy" => Self::Copy,
+            "Strip" => Self::Strip,
+            other => Self::Encoder(other.to_owned()),
+        }
+    }
+
+    pub fn ffmpeg_codec(&self) -> Option<&str> {
         match self {
             Self::Copy => Some("copy"),
             Self::Strip => None,
-            Self::H264X264 => Some("libx264"),
-            Self::H264Nvenc => Some("h264_nvenc"),
-            Self::H265X265 => Some("libx265"),
-            Self::H265Nvenc => Some("hevc_nvenc"),
-            Self::Vp9 => Some("libvpx-vp9"),
-            Self::Av1Svt => Some("libsvtav1"),
-            Self::Av1Aom => Some("libaom-av1"),
-            Self::Aac => Some("aac"),
-            Self::Opus => Some("libopus"),
-            Self::Vorbis => Some("libvorbis"),
-            Self::Eac3 => Some("eac3"),
-            Self::Mp3 => Some("libmp3lame"),
-            Self::Flac => Some("flac"),
-            Self::MovText => Some("mov_text"),
-            Self::Srt => Some("srt"),
-            Self::WebVtt => Some("webvtt"),
-            Self::PngSequence => Some("png"),
-            Self::JpegSequence => Some("mjpeg"),
-            Self::Gif => Some("gif"),
+            Self::Encoder(name) => Some(name),
         }
     }
 }
@@ -238,7 +162,7 @@ pub struct Track {
     pub codec: String,
     pub language: String,
     pub title: String,
-    pub choice: CodecChoice,
+    pub choice: TrackOutput,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -270,32 +194,10 @@ pub struct ConvertSettings {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct Av1anSettings {
-    pub enabled: bool,
-    pub encoder: CodecChoice,
-    pub workers: u32,
-    pub threads: u32,
-    pub splitter: String,
-    pub chunk_method: String,
-    pub concat_mode: String,
-    pub chunk_order: String,
-    pub resume: bool,
-    pub film_grain: u32,
-    pub grain_denoise: bool,
-    pub target_vmaf: u32,
-    pub custom_encoder_args: String,
-    pub custom_av1an_args: String,
-    pub copy_subtitles: bool,
-    pub copy_attachments: bool,
-    pub copy_data: bool,
-}
-
-#[derive(Clone, Debug, PartialEq)]
 pub struct AppState {
     pub files: Vec<MediaFile>,
     pub selected_file: Option<usize>,
     pub convert: ConvertSettings,
-    pub av1an: Av1anSettings,
     pub utility: Utility,
 }
 
@@ -330,37 +232,12 @@ impl Default for ConvertSettings {
     }
 }
 
-impl Default for Av1anSettings {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            encoder: CodecChoice::Av1Svt,
-            workers: 6,
-            threads: 0,
-            splitter: "scenedetect".into(),
-            chunk_method: "segment".into(),
-            concat_mode: "ffmpeg".into(),
-            chunk_order: "long-to-short".into(),
-            resume: true,
-            film_grain: 0,
-            grain_denoise: false,
-            target_vmaf: 95,
-            custom_encoder_args: String::new(),
-            custom_av1an_args: String::new(),
-            copy_subtitles: true,
-            copy_attachments: true,
-            copy_data: false,
-        }
-    }
-}
-
 impl Default for AppState {
     fn default() -> Self {
         Self {
             files: Vec::new(),
             selected_file: None,
             convert: ConvertSettings::default(),
-            av1an: Av1anSettings::default(),
             utility: Utility::ReadBitrates,
         }
     }
@@ -374,11 +251,7 @@ impl AppState {
 }
 
 pub fn command_preview(state: &AppState) -> String {
-    if state.av1an.enabled {
-        build_av1an_command(state)
-    } else {
-        build_ffmpeg_command(state)
-    }
+    build_ffmpeg_command(state)
 }
 
 pub fn utility_command(state: &AppState) -> String {
@@ -407,10 +280,6 @@ pub fn utility_command(state: &AppState) -> String {
 }
 
 pub fn ffmpeg_args(state: &AppState) -> Vec<String> {
-    if state.av1an.enabled {
-        return Vec::new();
-    }
-
     let Some(file) = state.selected_file() else {
         return Vec::new();
     };
@@ -447,14 +316,14 @@ fn build_ffmpeg_args(state: &AppState, file: &MediaFile, quoted: bool) -> Vec<St
     args.extend(["-i".to_owned(), path_arg(&file.name, quoted)]);
 
     for track in file.tracks.iter().filter(|track| track.enabled) {
-        if track.choice != CodecChoice::Strip {
+        if track.choice != TrackOutput::Strip {
             args.push("-map".into());
             args.push(format!("0:{}?", track.source_index));
         }
     }
 
     for track in file.tracks.iter().filter(|track| track.enabled) {
-        if track.choice == CodecChoice::Strip {
+        if track.choice == TrackOutput::Strip {
             continue;
         }
 
@@ -492,84 +361,6 @@ fn build_ffmpeg_args(state: &AppState, file: &MediaFile, quoted: bool) -> Vec<St
     extend_shell_words(&mut args, &state.convert.custom_args_out);
     args.push(path_arg(&output_name_from_settings(&state.convert), quoted));
     args
-}
-
-fn build_av1an_command(state: &AppState) -> String {
-    let Some(file) = state.selected_file() else {
-        return "Drop or select an input file to generate a command.".into();
-    };
-
-    let mut args = vec![
-        "av1an".to_owned(),
-        "-i".to_owned(),
-        shell_quote(&file.name),
-        "-o".to_owned(),
-        output_path(&state.convert),
-        "--encoder".into(),
-        match state.av1an.encoder {
-            CodecChoice::Av1Aom => "aom",
-            CodecChoice::Av1Svt => "svt-av1",
-            CodecChoice::Vp9 => "vpx",
-            CodecChoice::H265X265 => "x265",
-            _ => "svt-av1",
-        }
-        .into(),
-        "--workers".into(),
-        state.av1an.workers.to_string(),
-        "--split-method".into(),
-        state.av1an.splitter.clone(),
-        "--chunk-method".into(),
-        state.av1an.chunk_method.clone(),
-        "--concat".into(),
-        state.av1an.concat_mode.clone(),
-        "--chunk-order".into(),
-        state.av1an.chunk_order.clone(),
-    ];
-
-    if state.av1an.resume {
-        args.push("--resume".into());
-    }
-
-    if state.convert.quality_mode == QualityMode::Vmaf {
-        args.push("--target-quality".into());
-        args.push(state.av1an.target_vmaf.to_string());
-    } else {
-        args.push("-v".into());
-        args.push(format!("--crf {}", state.convert.quality_value));
-    }
-
-    if state.av1an.encoder == CodecChoice::Av1Svt && state.av1an.film_grain > 0 {
-        args.push("--photon-noise".into());
-        args.push(state.av1an.film_grain.to_string());
-    }
-
-    if state.av1an.threads > 0 {
-        args.push("--set-thread-affinity".into());
-        args.push(state.av1an.threads.to_string());
-    }
-
-    if state.av1an.grain_denoise {
-        args.push("--photon-noise-denoise".into());
-    }
-
-    if state.av1an.copy_subtitles {
-        args.push("--keep".into());
-        args.push("s".into());
-    }
-
-    if state.av1an.copy_attachments {
-        args.push("--keep".into());
-        args.push("t".into());
-    }
-
-    if state.av1an.copy_data {
-        args.push("--keep".into());
-        args.push("d".into());
-    }
-
-    extend_shell_words(&mut args, &state.av1an.custom_encoder_args);
-    extend_shell_words(&mut args, &state.av1an.custom_av1an_args);
-    args.join(" ")
 }
 
 fn append_quality_args(args: &mut Vec<String>, settings: &ConvertSettings) {
@@ -669,10 +460,6 @@ fn extend_shell_words(args: &mut Vec<String>, value: &str) {
     args.extend(value.split_whitespace().map(ToOwned::to_owned));
 }
 
-fn output_path(settings: &ConvertSettings) -> String {
-    shell_quote(&output_name_from_settings(settings))
-}
-
 fn path_arg(path: &str, quoted: bool) -> String {
     if quoted {
         shell_quote(path)
@@ -720,7 +507,7 @@ mod tests {
                         codec: "HEVC 10-bit".into(),
                         language: "und".into(),
                         title: "Main video".into(),
-                        choice: CodecChoice::Av1Svt,
+                        choice: TrackOutput::Encoder("libsvtav1".into()),
                     },
                     Track {
                         id: 2,
@@ -730,7 +517,7 @@ mod tests {
                         codec: "DTS-HD MA 5.1".into(),
                         language: "eng".into(),
                         title: "Surround".into(),
-                        choice: CodecChoice::Opus,
+                        choice: TrackOutput::Encoder("libopus".into()),
                     },
                     Track {
                         id: 3,
@@ -740,7 +527,7 @@ mod tests {
                         codec: "PGS".into(),
                         language: "eng".into(),
                         title: "Signs and songs".into(),
-                        choice: CodecChoice::Srt,
+                        choice: TrackOutput::Encoder("srt".into()),
                     },
                 ],
             }],

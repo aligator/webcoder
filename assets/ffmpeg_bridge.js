@@ -163,12 +163,20 @@ function rateLabel(value) {
 }
 
 function parseEncoders(log) {
-  const encoders = new Set();
+  // Each encoder line looks like: " V....D libx264   libx264 H.264 / AVC ..."
+  // The leading letter is the media type (V/A/S); capture name + description so
+  // the UI can group encoders by stream kind without any hardcoded list.
+  const kinds = { V: "Video", A: "Audio", S: "Subtitle" };
+  const encoders = new Map();
   for (const line of log.split(/\r?\n/)) {
-    const match = line.match(/^\s*[VAS]\S*\s+([A-Za-z0-9_.-]+)/);
-    if (match) encoders.add(match[1]);
+    const match = line.match(/^\s*([VAS])[.A-Za-z]{5}\s+([A-Za-z0-9][\w.-]*)\s+(.*)$/);
+    if (!match) continue;
+    const [, typeChar, name, description] = match;
+    if (!encoders.has(name)) {
+      encoders.set(name, { name, kind: kinds[typeChar], description: description.trim() });
+    }
   }
-  return [...encoders].sort((left, right) => left.localeCompare(right));
+  return [...encoders.values()].sort((left, right) => left.name.localeCompare(right.name));
 }
 
 function parseStreams(log) {

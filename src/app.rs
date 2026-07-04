@@ -1,11 +1,10 @@
 use crate::core::{
-    AppState, Av1anSettings, CodecChoice, ConvertSettings, MediaFile, Mode, QualityMode,
-    StreamKind, Track, Utility, command_preview, ffmpeg_args, format_size, output_file_name,
-    utility_command,
+    AppState, ConvertSettings, MediaFile, Mode, QualityMode, StreamKind, Track, TrackOutput,
+    Utility, command_preview, ffmpeg_args, format_size, output_file_name, utility_command,
 };
 use js_sys::{Array, Reflect};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::rc::Rc;
 use wasm_bindgen::JsValue;
 use wasm_bindgen::prelude::*;
@@ -36,7 +35,6 @@ enum Tab {
     Input,
     Tracks,
     Convert,
-    Av1an,
     Utilities,
     Queue,
 }
@@ -46,10 +44,19 @@ impl Tab {
         (Self::Input, "input", "Input"),
         (Self::Tracks, "checklist", "Tracks"),
         (Self::Convert, "tune", "Convert"),
-        (Self::Av1an, "movie", "AV1AN"),
         (Self::Utilities, "construction", "Utilities"),
         (Self::Queue, "queue", "Queue"),
     ];
+}
+
+/// One encoder exposed by the bundled FFmpeg WASM core, parsed from
+/// `ffmpeg -encoders`. Drives the per-track output dropdown so it lists only
+/// codecs the browser build can actually run.
+#[derive(Clone, Debug, PartialEq)]
+struct BrowserEncoder {
+    name: String,
+    kind: StreamKind,
+    description: String,
 }
 
 #[function_component(App)]
@@ -59,12 +66,36 @@ pub fn app() -> Html {
     let copied = use_state(|| false);
     let show_command_preview = use_state(|| false);
     let job_log = use_state(|| "Browser FFmpeg runtime idle.".to_owned());
-    let browser_encoders = use_state(Vec::<String>::new);
+    let browser_encoders = use_state(Vec::<BrowserEncoder>::new);
     let browser_capability_status =
-        use_state(|| "Browser FFmpeg capabilities not checked.".to_owned());
+        use_state(|| "Detecting bundled FFmpeg WASM encoders...".to_owned());
     let output_url = use_state(String::new);
     let output_name = use_state(String::new);
     let browser_files = use_mut_ref(HashMap::<usize, File>::new);
+
+    // Probe the bundled FFmpeg WASM core once on load so every output dropdown
+    // is populated with the encoders the browser can really run.
+    {
+        let browser_encoders = browser_encoders.clone();
+        let browser_capability_status = browser_capability_status.clone();
+        use_effect_with((), move |_| {
+            spawn_local(async move {
+                match fetch_browser_encoders().await {
+                    Ok((encoders, _log)) => {
+                        browser_capability_status.set(browser_codec_summary(&encoders));
+                        browser_encoders.set(encoders);
+                    }
+                    Err(error) => {
+                        browser_capability_status.set(format!(
+                            "Browser capability check failed: {}",
+                            js_error_text(error)
+                        ));
+                    }
+                }
+            });
+            || ()
+        });
+    }
 
     let active_command = command_preview(&state);
     let utility = utility_command(&state);
@@ -141,9 +172,8 @@ pub fn app() -> Html {
                     <div class="primary-pane">
                         { match *tab {
                             Tab::Input => view_input(&state, &browser_files, &job_log),
-                            Tab::Tracks => view_tracks(&state),
+                            Tab::Tracks => view_tracks(&state, &browser_encoders),
                             Tab::Convert => view_convert(&state),
-                            Tab::Av1an => view_av1an(&state),
                             Tab::Utilities => view_utilities(&state, &utility),
                             Tab::Queue => view_queue(
                                 &state,
@@ -193,7 +223,6 @@ fn page_title(tab: Tab) -> &'static str {
         Tab::Input => "Input",
         Tab::Tracks => "Track List",
         Tab::Convert => "Convert",
-        Tab::Av1an => "AV1AN Chunking",
         Tab::Utilities => "Utilities",
         Tab::Queue => "Queue",
     }
@@ -204,9 +233,8 @@ fn page_subtitle(tab: Tab) -> &'static str {
         Tab::Input => "Add media files and choose muxing or batch processing.",
         Tab::Tracks => "Enable, rename, reorder, copy, strip, or transcode streams.",
         Tab::Convert => "Tune container, codecs, quality, resize, crop, and audio settings.",
-        Tab::Av1an => "Prepare chunked encodes with worker, splitter, resume, and grain controls.",
         Tab::Utilities => "Build analysis, metadata, concat, and bitrate sampling commands.",
-        Tab::Queue => "Review the generated job before sending it to your native toolchain.",
+        Tab::Queue => "Run the encode entirely in your browser with FFmpeg WASM.",
     }
 }
 
@@ -382,7 +410,10 @@ fn select_first_track_file(state: &UseStateHandle<AppState>) -> Callback<MouseEv
     })
 }
 
-fn view_tracks(state: &UseStateHandle<AppState>) -> Html {
+fn view_tracks(
+    state: &UseStateHandle<AppState>,
+    browser_encoders: &UseStateHandle<Vec<BrowserEncoder>>,
+) -> Html {
     let Some(file) = state.selected_file() else {
         return empty_panel("No selected input");
     };
@@ -402,7 +433,7 @@ fn view_tracks(state: &UseStateHandle<AppState>) -> Html {
                     codec: "Unknown".into(),
                     language: "und".into(),
                     title: "New track".into(),
-                    choice: CodecChoice::Copy,
+                    choice: TrackOutput::Copy,
                 });
             }
             state.set(next);
@@ -437,14 +468,19 @@ fn view_tracks(state: &UseStateHandle<AppState>) -> Html {
                     <span>{"Output"}</span>
                     <span>{"Move"}</span>
                 </div>
-                { for file.tracks.iter().map(|track| view_track_row(state, file_id, track)) }
+                { for file.tracks.iter().map(|track| view_track_row(state, file_id, track, browser_encoders)) }
             </div>
             <textarea class="stream-details" readonly=true value={stream_details(file)} />
         </div>
     }
 }
 
-fn view_track_row(state: &UseStateHandle<AppState>, file_id: usize, track: &Track) -> Html {
+fn view_track_row(
+    state: &UseStateHandle<AppState>,
+    file_id: usize,
+    track: &Track,
+    browser_encoders: &UseStateHandle<Vec<BrowserEncoder>>,
+) -> Html {
     let track_id = track.id;
     html! {
         <div class="track-row">
@@ -475,10 +511,10 @@ fn view_track_row(state: &UseStateHandle<AppState>, file_id: usize, track: &Trac
                 oninput={update_track_text(state, file_id, track_id, |track, value| track.title = value)}
             />
             <select
-                value={track.choice.label()}
-                onchange={update_track_codec(state, file_id, track_id, track.kind)}
+                value={track.choice.label().to_owned()}
+                onchange={update_track_codec(state, file_id, track_id)}
             >
-                { for codecs_for(track.kind).iter().map(|choice| selected_option(choice.label(), track.choice.label())) }
+                { encoder_options(browser_encoders, track.kind, &track.choice) }
             </select>
             <div class="row-actions">
                 <button class="icon-button subtle material-symbols-rounded" title="Move up" onclick={move_track(state, file_id, track_id, -1)}>{"keyboard_arrow_up"}</button>
@@ -585,103 +621,6 @@ fn view_convert(state: &UseStateHandle<AppState>) -> Html {
     }
 }
 
-fn view_av1an(state: &UseStateHandle<AppState>) -> Html {
-    let av1an = &state.av1an;
-
-    html! {
-        <div class="settings-grid">
-            <section class="settings-group wide">
-                <div class="panel-title">{ icon("video_settings") }<h2>{"Chunked Encoding"}</h2></div>
-                <label class="check-line">
-                    <input
-                        type="checkbox"
-                        checked={av1an.enabled}
-                        onchange={update_av1an_bool(state, |settings, value| settings.enabled = value)}
-                    />
-                    <span>{"Use AV1AN command builder"}</span>
-                </label>
-                <div class="three-col">
-                    <label>
-                        <span>{"Encoder"}</span>
-                        <select value={av1an.encoder.label()} onchange={update_av1an_encoder(state)}>
-                            { selected_option(CodecChoice::Av1Svt.label(), av1an.encoder.label()) }
-                            { selected_option(CodecChoice::Av1Aom.label(), av1an.encoder.label()) }
-                            { selected_option(CodecChoice::Vp9.label(), av1an.encoder.label()) }
-                            { selected_option(CodecChoice::H265X265.label(), av1an.encoder.label()) }
-                        </select>
-                    </label>
-                    { number_field("Workers", av1an.workers, 1, 64, update_av1an_number(state, |settings, value| settings.workers = value)) }
-                    { number_field("Threads", av1an.threads, 0, 128, update_av1an_number(state, |settings, value| settings.threads = value)) }
-                    { number_field("Target VMAF", av1an.target_vmaf, 1, 100, update_av1an_number(state, |settings, value| settings.target_vmaf = value)) }
-                </div>
-            </section>
-
-            <section class="settings-group">
-                <div class="panel-title">{ icon("call_split") }<h2>{"Splitting"}</h2></div>
-                { select_field("Split method", av1an.splitter.clone(), &["scenedetect", "ffms2", "none"], update_av1an_select(state, |settings, value| settings.splitter = value)) }
-                { select_field("Chunk method", av1an.chunk_method.clone(), &["segment", "lsmash", "hybrid"], update_av1an_select(state, |settings, value| settings.chunk_method = value)) }
-                { select_field("Concat mode", av1an.concat_mode.clone(), &["ffmpeg", "mkvmerge", "ivf"], update_av1an_select(state, |settings, value| settings.concat_mode = value)) }
-                { select_field("Chunk order", av1an.chunk_order.clone(), &["long-to-short", "sequential", "random"], update_av1an_select(state, |settings, value| settings.chunk_order = value)) }
-            </section>
-
-            <section class="settings-group">
-                <div class="panel-title">{ icon("play_circle") }<h2>{"Runtime"}</h2></div>
-                <label class="check-line">
-                    <input
-                        type="checkbox"
-                        checked={av1an.resume}
-                        onchange={update_av1an_bool(state, |settings, value| settings.resume = value)}
-                    />
-                    <span>{"Resume stopped encodes"}</span>
-                </label>
-                { number_field("Film grain", av1an.film_grain, 0, 50, update_av1an_number(state, |settings, value| settings.film_grain = value)) }
-                <label class="check-line">
-                    <input
-                        type="checkbox"
-                        checked={av1an.grain_denoise}
-                        onchange={update_av1an_bool(state, |settings, value| settings.grain_denoise = value)}
-                    />
-                    <span>{"Denoise before grain synthesis"}</span>
-                </label>
-            </section>
-
-            <section class="settings-group wide">
-                <div class="panel-title">{ icon("merge") }<h2>{"Copy Streams"}</h2></div>
-                <div class="three-col">
-                    <label class="check-line">
-                        <input
-                            type="checkbox"
-                            checked={av1an.copy_subtitles}
-                            onchange={update_av1an_bool(state, |settings, value| settings.copy_subtitles = value)}
-                        />
-                        <span>{"Copy subtitles"}</span>
-                    </label>
-                    <label class="check-line">
-                        <input
-                            type="checkbox"
-                            checked={av1an.copy_attachments}
-                            onchange={update_av1an_bool(state, |settings, value| settings.copy_attachments = value)}
-                        />
-                        <span>{"Copy attachments"}</span>
-                    </label>
-                    <label class="check-line">
-                        <input
-                            type="checkbox"
-                            checked={av1an.copy_data}
-                            onchange={update_av1an_bool(state, |settings, value| settings.copy_data = value)}
-                        />
-                        <span>{"Copy data streams"}</span>
-                    </label>
-                </div>
-                <div class="two-col">
-                    { text_field("Custom Encoder Args", av1an.custom_encoder_args.clone(), update_av1an_text(state, |settings, value| settings.custom_encoder_args = value)) }
-                    { text_field("Custom AV1AN Args", av1an.custom_av1an_args.clone(), update_av1an_text(state, |settings, value| settings.custom_av1an_args = value)) }
-                </div>
-            </section>
-        </div>
-    }
-}
-
 fn view_utilities(state: &UseStateHandle<AppState>, command: &str) -> Html {
     html! {
         <div class="stack">
@@ -720,7 +659,7 @@ fn view_queue(
     on_copy: &Callback<MouseEvent>,
     copied: bool,
     job_log: &UseStateHandle<String>,
-    browser_encoders: &UseStateHandle<Vec<String>>,
+    browser_encoders: &UseStateHandle<Vec<BrowserEncoder>>,
     browser_capability_status: &UseStateHandle<String>,
     output_url: &UseStateHandle<String>,
     output_name: &UseStateHandle<String>,
@@ -759,16 +698,9 @@ fn view_queue(
         let state = state.clone();
         let browser_files = browser_files.clone();
         let job_log = job_log.clone();
-        let browser_encoders = browser_encoders.clone();
-        let browser_capability_status = browser_capability_status.clone();
         let output_url = output_url.clone();
         let output_name = output_name.clone();
         Callback::from(move |_| {
-            if state.av1an.enabled {
-                job_log.set("AV1AN is a native CLI workflow; switch AV1AN off to run FFmpeg in the browser.".into());
-                return;
-            }
-
             let Some(file_id) = state.selected_file else {
                 job_log.set("Select an input before running a browser encode.".into());
                 return;
@@ -792,44 +724,12 @@ fn view_queue(
 
             let output = output_file_name(&state);
 
-            job_log.set("Checking browser FFmpeg encoder support...".into());
             output_url.set(String::new());
             output_name.set(output.clone());
 
             let job_log_async = job_log.clone();
-            let browser_encoders_async = browser_encoders.clone();
-            let browser_capability_status_async = browser_capability_status.clone();
             let output_url_async = output_url.clone();
             spawn_local(async move {
-                let encoders = if browser_encoders_async.is_empty() {
-                    match fetch_browser_encoders().await {
-                        Ok((encoders, _log)) => {
-                            browser_capability_status_async.set(browser_codec_summary(&encoders));
-                            browser_encoders_async.set(encoders.clone());
-                            encoders
-                        }
-                        Err(error) => {
-                            job_log_async.set(format!(
-                                "Browser capability check failed: {}",
-                                js_error_text(error)
-                            ));
-                            return;
-                        }
-                    }
-                } else {
-                    (*browser_encoders_async).clone()
-                };
-
-                let missing = missing_requested_encoders(&args, &encoders);
-                if !missing.is_empty() {
-                    job_log_async.set(format!(
-                        "This generated command is valid for native FFmpeg, but the bundled browser FFmpeg core does not expose these requested encoder(s): {}.\n\nNothing was rewritten. Copy the native command, choose codecs that appear in the browser capability list, or replace the bundled FFmpeg WASM core with one that includes those encoders.\n\n{}",
-                        missing.join(", "),
-                        browser_codec_summary(&encoders)
-                    ));
-                    return;
-                }
-
                 let js_args = Array::new();
                 for arg in args {
                     js_args.push(&JsValue::from_str(&arg));
@@ -870,7 +770,7 @@ fn view_queue(
                     <small>{"streams"}</small>
                 </div>
                 <div class="queue-metric">
-                    <span>{ if state.av1an.enabled { "AV1AN" } else { "FFmpeg" } }</span>
+                    <span>{"FFmpeg"}</span>
                     <small>{"backend"}</small>
                 </div>
                 <div class="queue-metric">
@@ -952,7 +852,7 @@ fn file_to_media(id: usize, file: &web_sys::File) -> MediaFile {
             codec: "Audio".into(),
             language: "und".into(),
             title: "Audio".into(),
-            choice: CodecChoice::Eac3,
+            choice: TrackOutput::Copy,
         });
     } else {
         tracks.push(Track {
@@ -963,7 +863,7 @@ fn file_to_media(id: usize, file: &web_sys::File) -> MediaFile {
             codec: guessed_video_codec(&lower).into(),
             language: "und".into(),
             title: "Video".into(),
-            choice: CodecChoice::Av1Svt,
+            choice: TrackOutput::Copy,
         });
 
         tracks.push(Track {
@@ -974,7 +874,7 @@ fn file_to_media(id: usize, file: &web_sys::File) -> MediaFile {
             codec: "Audio".into(),
             language: "und".into(),
             title: "Main audio".into(),
-            choice: CodecChoice::Eac3,
+            choice: TrackOutput::Copy,
         });
     }
 
@@ -987,7 +887,7 @@ fn file_to_media(id: usize, file: &web_sys::File) -> MediaFile {
             codec: "Subtitle".into(),
             language: "und".into(),
             title: "Subtitle".into(),
-            choice: CodecChoice::Copy,
+            choice: TrackOutput::Copy,
         });
     }
 
@@ -1045,7 +945,7 @@ fn tracks_from_probe(result: &JsValue) -> Vec<Track> {
                 .collect::<String>()
                 .to_ascii_lowercase(),
             title: js_string(&stream, "title"),
-            choice: default_choice(stream_kind),
+            choice: TrackOutput::Copy,
         });
     }
 
@@ -1075,7 +975,7 @@ fn merge_probe_tracks(existing: &[Track], probed: Vec<Track>) -> Vec<Track> {
                 used[existing_index] = true;
                 let existing_track = &existing[existing_index];
                 probed_track.enabled = existing_track.enabled;
-                probed_track.choice = existing_track.choice;
+                probed_track.choice = existing_track.choice.clone();
             }
 
             probed_track
@@ -1108,16 +1008,16 @@ fn js_number(value: &JsValue, key: &str) -> Option<usize> {
         .map(|value| value as usize)
 }
 
-async fn fetch_browser_encoders() -> Result<(Vec<String>, String), JsValue> {
+async fn fetch_browser_encoders() -> Result<(Vec<BrowserEncoder>, String), JsValue> {
     let result = get_ffmpeg_capabilities().await?;
     Ok((
-        js_string_array(&result, "encoders"),
+        browser_encoders_from_js(&result),
         js_string(&result, "log"),
     ))
 }
 
-fn js_string_array(value: &JsValue, key: &str) -> Vec<String> {
-    let Ok(array_value) = Reflect::get(value, &JsValue::from_str(key)) else {
+fn browser_encoders_from_js(value: &JsValue) -> Vec<BrowserEncoder> {
+    let Ok(array_value) = Reflect::get(value, &JsValue::from_str("encoders")) else {
         return Vec::new();
     };
     if !Array::is_array(&array_value) {
@@ -1126,111 +1026,70 @@ fn js_string_array(value: &JsValue, key: &str) -> Vec<String> {
 
     let array = Array::from(&array_value);
     (0..array.length())
-        .filter_map(|index| array.get(index).as_string())
+        .filter_map(|index| {
+            let item = array.get(index);
+            let name = js_string(&item, "name");
+            if name.is_empty() {
+                return None;
+            }
+            let kind = match js_string(&item, "kind").as_str() {
+                "Audio" => StreamKind::Audio,
+                "Subtitle" => StreamKind::Subtitle,
+                _ => StreamKind::Video,
+            };
+            Some(BrowserEncoder {
+                name,
+                kind,
+                description: js_string(&item, "description"),
+            })
+        })
         .collect()
 }
 
-fn requested_encoders(args: &[String]) -> Vec<String> {
-    let mut encoders = Vec::new();
-    let mut index = 0;
-
-    while index + 1 < args.len() {
-        if is_codec_option(&args[index]) {
-            let codec = args[index + 1].trim();
-            if !codec.is_empty() && codec != "copy" {
-                encoders.push(codec.to_owned());
-            }
-            index += 2;
-        } else {
-            index += 1;
-        }
-    }
-
-    encoders
-}
-
-fn is_codec_option(arg: &str) -> bool {
-    matches!(arg, "-c" | "-codec" | "-vcodec" | "-acodec" | "-scodec")
-        || arg.starts_with("-c:")
-        || arg.starts_with("-codec:")
-}
-
-fn missing_requested_encoders(args: &[String], browser_encoders: &[String]) -> Vec<String> {
-    let available = browser_encoders
-        .iter()
-        .map(String::as_str)
-        .collect::<HashSet<_>>();
-    let mut missing = Vec::new();
-
-    for encoder in requested_encoders(args) {
-        if !available.contains(encoder.as_str()) && !missing.contains(&encoder) {
-            missing.push(encoder);
-        }
-    }
-
-    missing
-}
-
-fn browser_codec_summary(encoders: &[String]) -> String {
+fn browser_codec_summary(encoders: &[BrowserEncoder]) -> String {
     if encoders.is_empty() {
-        return "No browser encoders detected yet.".into();
+        return "No browser encoders detected.".into();
     }
 
-    const HIGHLIGHTS: &[&str] = &[
-        "libx264",
-        "h264",
-        "libx265",
-        "hevc",
-        "libvpx-vp9",
-        "libaom-av1",
-        "libsvtav1",
-        "aac",
-        "libopus",
-        "libvorbis",
-        "libmp3lame",
-        "eac3",
-        "flac",
-        "mov_text",
-        "srt",
-        "webvtt",
-        "png",
-        "mjpeg",
-        "gif",
-    ];
-
-    let available = encoders.iter().map(String::as_str).collect::<HashSet<_>>();
-    let highlights = HIGHLIGHTS
-        .iter()
-        .filter(|encoder| available.contains(**encoder))
-        .copied()
-        .collect::<Vec<_>>();
-
-    if highlights.is_empty() {
-        format!(
-            "Detected {} browser encoders. First available: {}",
-            encoders.len(),
-            encoders
-                .iter()
-                .take(16)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    } else {
-        format!(
-            "Detected {} browser encoders. Common available: {}",
-            encoders.len(),
-            highlights.join(", ")
-        )
-    }
+    let count = |kind: StreamKind| encoders.iter().filter(|e| e.kind == kind).count();
+    format!(
+        "Detected {} browser encoders: {} video, {} audio, {} subtitle.",
+        encoders.len(),
+        count(StreamKind::Video),
+        count(StreamKind::Audio),
+        count(StreamKind::Subtitle),
+    )
 }
 
-fn default_choice(kind: StreamKind) -> CodecChoice {
-    match kind {
-        StreamKind::Video => CodecChoice::Av1Svt,
-        StreamKind::Audio => CodecChoice::Eac3,
-        StreamKind::Subtitle => CodecChoice::Copy,
-        StreamKind::Attachment => CodecChoice::Copy,
+/// Build the output-codec `<option>` list for a track: `Copy`/`Strip` plus
+/// every detected browser encoder matching the stream kind. The currently
+/// selected encoder is always included so a probe finishing later never drops
+/// the user's choice.
+fn encoder_options(
+    browser_encoders: &[BrowserEncoder],
+    kind: StreamKind,
+    selected: &TrackOutput,
+) -> Html {
+    let selected_label = selected.label();
+
+    let mut names: Vec<&str> = browser_encoders
+        .iter()
+        .filter(|encoder| encoder.kind == kind)
+        .map(|encoder| encoder.name.as_str())
+        .collect();
+
+    if let TrackOutput::Encoder(name) = selected {
+        if !names.contains(&name.as_str()) {
+            names.push(name.as_str());
+        }
+    }
+
+    html! {
+        <>
+            { option_selected("Copy", selected_label == "Copy") }
+            { option_selected("Strip", selected_label == "Strip") }
+            { for names.iter().map(|name| option_selected(name, *name == selected_label)) }
+        </>
     }
 }
 
@@ -1357,8 +1216,10 @@ fn update_track_kind(
         };
         update_track(&state, file_id, track_id, |track| {
             track.kind = kind;
-            if !codecs_for(kind).contains(&track.choice) {
-                track.choice = default_choice(kind);
+            // An encoder is kind-specific; changing the stream type invalidates
+            // it, so fall back to the always-valid Copy. Copy/Strip carry over.
+            if matches!(track.choice, TrackOutput::Encoder(_)) {
+                track.choice = TrackOutput::Copy;
             }
         });
     })
@@ -1368,17 +1229,12 @@ fn update_track_codec(
     state: &UseStateHandle<AppState>,
     file_id: usize,
     track_id: usize,
-    kind: StreamKind,
 ) -> Callback<Event> {
     let state = state.clone();
     Callback::from(move |event: Event| {
         let value = event.target_unchecked_into::<HtmlSelectElement>().value();
-        let choice = codecs_for(kind)
-            .iter()
-            .copied()
-            .find(|choice| choice.label() == value)
-            .unwrap_or(CodecChoice::Copy);
-        update_track(&state, file_id, track_id, |track| track.choice = choice);
+        let choice = TrackOutput::from_label(&value);
+        update_track(&state, file_id, track_id, |track| track.choice = choice.clone());
     })
 }
 
@@ -1483,89 +1339,6 @@ fn update_quality_mode(state: &UseStateHandle<AppState>) -> Callback<Event> {
         };
         state.set(next);
     })
-}
-
-fn update_av1an_select(
-    state: &UseStateHandle<AppState>,
-    update: fn(&mut Av1anSettings, String),
-) -> Callback<Event> {
-    let state = state.clone();
-    Callback::from(move |event: Event| {
-        let value = event.target_unchecked_into::<HtmlSelectElement>().value();
-        let mut next = (*state).clone();
-        update(&mut next.av1an, value);
-        state.set(next);
-    })
-}
-
-fn update_av1an_number(
-    state: &UseStateHandle<AppState>,
-    update: fn(&mut Av1anSettings, u32),
-) -> Callback<InputEvent> {
-    let state = state.clone();
-    Callback::from(move |event: InputEvent| {
-        let value = event
-            .target_unchecked_into::<HtmlInputElement>()
-            .value()
-            .parse()
-            .unwrap_or_default();
-        let mut next = (*state).clone();
-        update(&mut next.av1an, value);
-        state.set(next);
-    })
-}
-
-fn update_av1an_bool(
-    state: &UseStateHandle<AppState>,
-    update: fn(&mut Av1anSettings, bool),
-) -> Callback<Event> {
-    let state = state.clone();
-    Callback::from(move |event: Event| {
-        let value = event.target_unchecked_into::<HtmlInputElement>().checked();
-        let mut next = (*state).clone();
-        update(&mut next.av1an, value);
-        state.set(next);
-    })
-}
-
-fn update_av1an_text(
-    state: &UseStateHandle<AppState>,
-    update: fn(&mut Av1anSettings, String),
-) -> Callback<InputEvent> {
-    let state = state.clone();
-    Callback::from(move |event: InputEvent| {
-        let value = event.target_unchecked_into::<HtmlInputElement>().value();
-        let mut next = (*state).clone();
-        update(&mut next.av1an, value);
-        state.set(next);
-    })
-}
-
-fn update_av1an_encoder(state: &UseStateHandle<AppState>) -> Callback<Event> {
-    let state = state.clone();
-    Callback::from(move |event: Event| {
-        let value = event.target_unchecked_into::<HtmlSelectElement>().value();
-        let mut next = (*state).clone();
-        next.av1an.encoder = [
-            CodecChoice::Av1Svt,
-            CodecChoice::Av1Aom,
-            CodecChoice::Vp9,
-            CodecChoice::H265X265,
-        ]
-        .into_iter()
-        .find(|choice| choice.label() == value)
-        .unwrap_or(CodecChoice::Av1Svt);
-        state.set(next);
-    })
-}
-
-fn codecs_for(kind: StreamKind) -> &'static [CodecChoice] {
-    match kind {
-        StreamKind::Video => CodecChoice::VIDEO,
-        StreamKind::Audio => CodecChoice::AUDIO,
-        StreamKind::Subtitle => CodecChoice::SUBTITLE,
-        StreamKind::Attachment => &[CodecChoice::Copy, CodecChoice::Strip],
-    }
 }
 
 fn selected_option(value: &str, selected: &str) -> Html {
