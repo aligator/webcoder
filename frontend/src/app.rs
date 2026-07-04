@@ -295,7 +295,7 @@ pub fn app() -> Html {
                     <span class="brand-mark material-symbols-rounded">{"movie_filter"}</span>
                     <div>
                         <strong>{"Webcoder"}</strong>
-                        <small>{"WebAssembly"}</small>
+                        <small>{"FFmpeg Transcoder"}</small>
                     </div>
                 </div>
                 <nav class="tab-list">
