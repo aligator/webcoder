@@ -35,6 +35,11 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev
 
+      - name: Stub frontend dist
+        # Tauri's build script validates that the `../dist` bundle resource
+        # exists. A compile check doesn't need the real assets, just the dir.
+        run: mkdir -p dist
+
       - name: Check native app
         run: cargo check -p webcoder-desktop --bin webcoder --locked
 
