@@ -14,18 +14,16 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             native::get_encoders_native,
             native::probe_native_path,
-            native::encode_native,
-            native::save_output_native
+            native::encode_native
         ])
         .setup(|app| {
             let handle = app.handle().clone();
-            let workdir = handle.path().app_local_data_dir()?.join("jobs");
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .expect("create tokio runtime");
             let backend = runtime
-                .block_on(native::NativeBackend::new(workdir))
+                .block_on(native::NativeBackend::new())
                 .map_err(std::io::Error::other)?;
             app.manage(backend);
 

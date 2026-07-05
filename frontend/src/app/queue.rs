@@ -5,16 +5,45 @@
 //! the tab reaches into the shared store only for the file list and settings,
 //! and reports save-all outcomes back up through the `on_toast` callback.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+
+use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 use yew::prelude::*;
 
 use super::bridge::{
-    js_error_text, native_app, parse_json, run_encode, save_all_outputs, save_output, with_api_key,
+    js_error_text, listen_encode_progress, native_app, parse_json, pick_output_dir, run_encode,
+    with_api_key,
 };
 use super::ingest::JobIds;
 use super::state::AppCtx;
-use super::types::{EncodeItem, EncodeResponse, EncodeStatus, SaveAllResult, SaveItem};
+use super::types::{EncodeItem, EncodeResponse, EncodeStatus};
 use super::widgets::icon;
+
+/// Shared per-job encode progress (job id → fraction 0..1), updated by the
+/// desktop `webcoder-encode-progress` event and read by the result rows.
+type Progress = Rc<RefCell<HashMap<String, f64>>>;
+
+// Desktop settings persisted in localStorage so the output folder and overwrite
+// choice survive reloads/restarts — no re-picking on every run.
+const LS_OUTPUT_DIR: &str = "webcoder_output_dir";
+const LS_OVERWRITE: &str = "webcoder_overwrite";
+
+fn local_storage() -> Option<web_sys::Storage> {
+    web_sys::window().and_then(|window| window.local_storage().ok().flatten())
+}
+
+fn ls_get(key: &str) -> Option<String> {
+    local_storage().and_then(|store| store.get_item(key).ok().flatten())
+}
+
+fn ls_set(key: &str, value: &str) {
+    if let Some(store) = local_storage() {
+        let _ = store.set_item(key, value);
+    }
+}
 
 #[derive(Properties, PartialEq)]
 pub(crate) struct QueueTabProps {
@@ -27,6 +56,14 @@ pub(crate) fn queue_tab(props: &QueueTabProps) -> Html {
     let state = use_context::<AppCtx>().expect("AppCtx not found");
     // Per-input encode results for the batch run — local to this tab.
     let results = use_state(Vec::<EncodeItem>::new);
+    // Desktop: overwrite existing output files. Default off. Persisted.
+    let overwrite = use_state(|| ls_get(LS_OVERWRITE).as_deref() == Some("1"));
+    // Desktop: chosen output folder, persisted across sessions.
+    let output_dir = use_state(|| ls_get(LS_OUTPUT_DIR).unwrap_or_default());
+    // Desktop: live per-file encode progress, updated from FFmpeg events.
+    let progress: Progress = use_mut_ref(HashMap::new);
+    let tick = use_state(|| 0u32);
+    let tick_counter = use_mut_ref(|| 0u32);
 
     let is_native = native_app();
     let job_ids = &props.job_ids;
@@ -36,37 +73,46 @@ pub(crate) fn queue_tab(props: &QueueTabProps) -> Html {
         .filter(|file| job_ids.borrow().contains_key(&file.id))
         .count();
 
-    let save_all = {
-        let results = results.clone();
+    // Register the desktop encode-progress listener once. Writes into the shared
+    // `progress` map and bumps `tick` to force a re-render of the result rows.
+    {
+        let progress = progress.clone();
+        let tick = tick.clone();
+        let tick_counter = tick_counter.clone();
+        use_effect_with((), move |_| {
+            let closure = Closure::wrap(Box::new(move |job_id: String, fraction: f64| {
+                progress.borrow_mut().insert(job_id, fraction);
+                let mut counter = tick_counter.borrow_mut();
+                *counter = counter.wrapping_add(1);
+                tick.set(*counter);
+            }) as Box<dyn FnMut(String, f64)>);
+            listen_encode_progress(closure.as_ref().unchecked_ref());
+            move || drop(closure)
+        });
+    }
+    // Depend on `tick` so progress events re-render the rows.
+    let _ = *tick;
+
+    // Desktop: choose and remember the output folder.
+    let choose_folder = {
+        let output_dir = output_dir.clone();
         let on_toast = props.on_toast.clone();
         Callback::from(move |_| {
-            let items: Vec<SaveItem> = results
-                .iter()
-                .filter(|item| item.status == EncodeStatus::Done && !item.output_path.is_empty())
-                .map(|item| SaveItem {
-                    output_path: item.output_path.clone(),
-                    output_name: item.output_name.clone(),
-                })
-                .collect();
-            if items.is_empty() {
-                return;
-            }
-            let Ok(payload) = serde_json::to_string(&items) else {
-                return;
-            };
+            let output_dir = output_dir.clone();
             let on_toast = on_toast.clone();
             spawn_local(async move {
-                match save_all_outputs(payload).await {
-                    Ok(value) => match parse_json::<SaveAllResult>(value) {
-                        Ok(result) if result.saved > 0 => {
-                            on_toast.emit(format!("Copied {} files to the chosen folder.", result.saved))
+                match pick_output_dir().await {
+                    Ok(value) => {
+                        let dir = value.as_string().unwrap_or_default();
+                        if !dir.is_empty() {
+                            ls_set(LS_OUTPUT_DIR, &dir);
+                            output_dir.set(dir);
                         }
-                        Ok(_) => {}
-                        Err(error) => on_toast.emit(format!("Save all failed: {error}")),
-                    },
-                    Err(error) => {
-                        on_toast.emit(format!("Save all failed: {}", js_error_text(error)))
                     }
+                    Err(error) => on_toast.emit(format!(
+                        "Could not open folder picker: {}",
+                        js_error_text(error)
+                    )),
                 }
             });
         })
@@ -76,6 +122,10 @@ pub(crate) fn queue_tab(props: &QueueTabProps) -> Html {
         let state = state.clone();
         let job_ids = job_ids.clone();
         let results = results.clone();
+        let overwrite = overwrite.clone();
+        let output_dir = output_dir.clone();
+        let progress = progress.clone();
+        let on_toast = props.on_toast.clone();
         Callback::from(move |_| {
             // Snapshot every ready input up front (job id, per-file tracks,
             // per-file output name). The whole batch runs in one task so the
@@ -110,8 +160,18 @@ pub(crate) fn queue_tab(props: &QueueTabProps) -> Html {
                 return;
             }
 
+            // Desktop uses the remembered output folder; abort if none chosen.
+            let output_dir = if is_native { (*output_dir).clone() } else { String::new() };
+            if is_native && output_dir.is_empty() {
+                on_toast.emit("Choose an output folder first.".to_owned());
+                return;
+            }
+
             let results = results.clone();
+            let progress = progress.clone();
+            let overwrite = *overwrite;
             spawn_local(async move {
+                progress.borrow_mut().clear();
                 let mut items: Vec<EncodeItem> = jobs
                     .iter()
                     .map(|(name, job_id, ..)| EncodeItem {
@@ -128,7 +188,15 @@ pub(crate) fn queue_tab(props: &QueueTabProps) -> Html {
 
                 for (index, (_, job_id, settings_json, tracks_json)) in jobs.into_iter().enumerate()
                 {
-                    match run_encode(job_id, settings_json, tracks_json).await {
+                    match run_encode(
+                        job_id,
+                        settings_json,
+                        tracks_json,
+                        output_dir.clone(),
+                        overwrite,
+                    )
+                    .await
+                    {
                         Ok(value) => match parse_json::<EncodeResponse>(value) {
                             Ok(response) => {
                                 items[index].status = if response.ok {
@@ -190,6 +258,8 @@ pub(crate) fn queue_tab(props: &QueueTabProps) -> Html {
                         if results.is_empty() {
                             Html::default()
                         } else {
+                            // Browser: zip-download every finished output. Desktop
+                            // writes straight into the chosen folder, so no action.
                             let zip_link = if done_ids.len() > 1 && !is_native {
                                 let href = with_api_key(&format!("/api/zip?jobs={}", done_ids.join(",")));
                                 html! {
@@ -197,13 +267,6 @@ pub(crate) fn queue_tab(props: &QueueTabProps) -> Html {
                                         { icon("folder_zip") }
                                         { "Download all" }
                                     </a>
-                                }
-                            } else if done_ids.len() > 1 && is_native {
-                                html! {
-                                    <button class="command-button accent result-download" type="button" onclick={save_all.clone()}>
-                                        { icon("folder") }
-                                        { "Save all" }
-                                    </button>
                                 }
                             } else {
                                 Html::default()
@@ -217,7 +280,40 @@ pub(crate) fn queue_tab(props: &QueueTabProps) -> Html {
                         }
                     }}
                 </div>
-                <button class="command-button accent" onclick={run_batch} disabled={ready == 0}>
+                {
+                    if is_native {
+                        let toggle = {
+                            let overwrite = overwrite.clone();
+                            Callback::from(move |_| {
+                                let next = !*overwrite;
+                                ls_set(LS_OVERWRITE, if next { "1" } else { "0" });
+                                overwrite.set(next);
+                            })
+                        };
+                        let dir_empty = output_dir.is_empty();
+                        html! {
+                            <>
+                                <div class="output-folder">
+                                    <span class="field-label">{ "Output folder" }</span>
+                                    <span class={classes!("output-folder-path", dir_empty.then_some("is-empty"))}>
+                                        { if dir_empty { "No folder selected".to_owned() } else { (*output_dir).clone() } }
+                                    </span>
+                                    <button class="command-button result-download" type="button" onclick={choose_folder}>
+                                        { icon("folder") }
+                                        { "Choose…" }
+                                    </button>
+                                </div>
+                                <label class="overwrite-toggle">
+                                    <input type="checkbox" checked={*overwrite} onchange={toggle} />
+                                    { "Overwrite existing files" }
+                                </label>
+                            </>
+                        }
+                    } else {
+                        Html::default()
+                    }
+                }
+                <button class="command-button accent" onclick={run_batch} disabled={ready == 0 || (is_native && output_dir.is_empty())}>
                     { format!("RUN ({ready})") }
                 </button>
                 <div class="results-list">
@@ -226,7 +322,10 @@ pub(crate) fn queue_tab(props: &QueueTabProps) -> Html {
                             { if ready == 0 { "Add inputs on the Media page." } else { "Ready. Press RUN to batch-encode." } }
                         </div> }
                     } else {
-                        html! { for results.iter().map(|item| html! { <ResultRow item={item.clone()} /> }) }
+                        html! { for results.iter().map(|item| {
+                            let fraction = progress.borrow().get(&item.job_id).copied();
+                            html! { <ResultRow item={item.clone()} fraction={fraction} /> }
+                        }) }
                     } }
                 </div>
             </section>
@@ -237,28 +336,28 @@ pub(crate) fn queue_tab(props: &QueueTabProps) -> Html {
 #[derive(Properties, PartialEq)]
 struct ResultRowProps {
     item: EncodeItem,
+    /// Desktop live progress for this file (0..1), if any.
+    fraction: Option<f64>,
 }
 
 #[function_component(ResultRow)]
 fn result_row(props: &ResultRowProps) -> Html {
     let item = &props.item;
+    let running = item.status == EncodeStatus::Running;
+    let percent = props.fraction.map(|value| (value * 100.0).round() as u32);
     let (badge, label, status_class) = match item.status {
-        EncodeStatus::Running => ("hourglass_top", "Encoding", "is-running"),
-        EncodeStatus::Done => ("check_circle", "Done", "is-done"),
-        EncodeStatus::Failed => ("error", "Failed", "is-failed"),
+        EncodeStatus::Running => (
+            "hourglass_top",
+            match percent {
+                Some(value) => format!("Encoding {value}%"),
+                None => "Encoding".to_owned(),
+            },
+            "is-running",
+        ),
+        EncodeStatus::Done => ("check_circle", "Done".to_owned(), "is-done"),
+        EncodeStatus::Failed => ("error", "Failed".to_owned(), "is-failed"),
     };
     let open = item.status == EncodeStatus::Failed;
-    let save_native = {
-        let output_path = item.output_path.clone();
-        let output_name = item.output_name.clone();
-        Callback::from(move |_| {
-            let output_path = output_path.clone();
-            let output_name = output_name.clone();
-            spawn_local(async move {
-                let _ = save_output(output_path, output_name).await;
-            });
-        })
-    };
     html! {
         <div class={classes!("result-card", status_class)}>
             <div class="result-head">
@@ -266,14 +365,9 @@ fn result_row(props: &ResultRowProps) -> Html {
                 <strong>{&item.name}</strong>
                 <span class="result-status">{label}</span>
                 {
-                    if !item.output_path.is_empty() {
-                        html! {
-                            <button class="command-button accent result-download" type="button" onclick={save_native}>
-                                { icon("download") }
-                                { "Save" }
-                            </button>
-                        }
-                    } else if !item.download_url.is_empty() {
+                    // Browser: offer a download link. Desktop writes the file
+                    // straight into the chosen output folder, so no button.
+                    if !item.download_url.is_empty() {
                         html! {
                             <a class="command-button accent result-download" href={item.download_url.clone()} download={item.output_name.clone()}>
                                 { icon("download") }
@@ -285,6 +379,25 @@ fn result_row(props: &ResultRowProps) -> Html {
                     }
                 }
             </div>
+            {
+                if running {
+                    let style = percent
+                        .map(|value| format!("width:{value}%"))
+                        .unwrap_or_else(|| "width:0%".to_owned());
+                    let bar_class = if percent.is_some() {
+                        classes!("progress-bar")
+                    } else {
+                        classes!("progress-bar", "indeterminate")
+                    };
+                    html! {
+                        <div class="progress-track">
+                            <div class={bar_class} style={style}></div>
+                        </div>
+                    }
+                } else {
+                    Html::default()
+                }
+            }
             {
                 if item.log.is_empty() {
                     Html::default()

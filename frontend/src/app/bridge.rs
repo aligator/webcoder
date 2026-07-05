@@ -31,19 +31,18 @@ extern "C" {
         job_id: String,
         settings_json: String,
         tracks_json: String,
+        output_dir: String,
+        overwrite: bool,
     ) -> Result<JsValue, JsValue>;
 
     #[wasm_bindgen(js_name = withApiKey)]
     pub(crate) fn with_api_key(url: &str) -> String;
 
-    #[wasm_bindgen(catch, js_name = saveOutput)]
-    pub(crate) async fn save_output(
-        output_path: String,
-        output_name: String,
-    ) -> Result<JsValue, JsValue>;
+    #[wasm_bindgen(catch, js_name = pickOutputDir)]
+    pub(crate) async fn pick_output_dir() -> Result<JsValue, JsValue>;
 
-    #[wasm_bindgen(catch, js_name = saveAllOutputs)]
-    pub(crate) async fn save_all_outputs(items_json: String) -> Result<JsValue, JsValue>;
+    #[wasm_bindgen(js_name = listenEncodeProgress)]
+    pub(crate) fn listen_encode_progress(callback: &JsValue);
 }
 
 /// Decode a JSON string returned by the api.js bridge into `T`.

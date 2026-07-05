@@ -50,19 +50,6 @@ pub(crate) struct EncodeItem {
     pub(crate) output_name: String,
 }
 
-/// One finished output to copy in a "Save all" batch, serialized to the bridge.
-#[derive(serde::Serialize)]
-pub(crate) struct SaveItem {
-    pub(crate) output_path: String,
-    pub(crate) output_name: String,
-}
-
-/// Result of a "Save all" batch: how many files were copied (0 = cancelled).
-#[derive(Deserialize)]
-pub(crate) struct SaveAllResult {
-    pub(crate) saved: usize,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Tab {
     Media,

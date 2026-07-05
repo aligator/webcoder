@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::Value;
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::sync::{Mutex, Semaphore};
 use webcoder_frontend::core::{self, ConvertSettings, StreamKind, Track, TrackOutput};
 
@@ -15,7 +16,6 @@ pub struct NativeBackend {
 }
 
 struct Inner {
-    workdir: PathBuf,
     ffmpeg: String,
     ffprobe: String,
     encoders: Vec<EncoderInfo>,
@@ -26,9 +26,15 @@ struct Inner {
 }
 
 struct JobEntry {
-    dir: PathBuf,
     input: PathBuf,
     stream_count: usize,
+    duration: Option<f64>,
+}
+
+#[derive(Serialize, Clone)]
+struct ProgressPayload {
+    job_id: String,
+    fraction: f64,
 }
 
 #[derive(Serialize, Clone)]
@@ -58,10 +64,7 @@ pub struct EncodeResponse {
 }
 
 impl NativeBackend {
-    pub async fn new(workdir: PathBuf) -> Result<Self, String> {
-        tokio::fs::create_dir_all(&workdir)
-            .await
-            .map_err(|error| format!("create workdir: {error}"))?;
+    pub async fn new() -> Result<Self, String> {
         let ffmpeg = std::env::var("WEBCODER_FFMPEG").unwrap_or_else(|_| "ffmpeg".into());
         let ffprobe = std::env::var("WEBCODER_FFPROBE").unwrap_or_else(|_| "ffprobe".into());
         let encoders = probe_encoders(&ffmpeg).await?;
@@ -69,7 +72,6 @@ impl NativeBackend {
         eprintln!("webcoder: detected {} encoders", encoders.len());
         Ok(Self {
             inner: Arc::new(Inner {
-                workdir,
                 ffmpeg,
                 ffprobe,
                 encoders,
@@ -100,20 +102,23 @@ pub async fn probe_native_path(
         .map_err(|error| format!("read file metadata: {error}"))?;
     let (tracks, stream_count, format) = probe_input(&state.inner.ffprobe, &path).await?;
     let job_id = uuid::Uuid::new_v4().to_string();
-    let dir = state.inner.workdir.join(&job_id);
-    tokio::fs::create_dir_all(&dir)
-        .await
-        .map_err(|error| format!("create job dir: {error}"))?;
     let file_name = path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned());
+    // Desktop mode encodes straight into the user-chosen output folder, so no
+    // temp/job directory is needed — only the total duration for progress.
+    let duration = format
+        .as_ref()
+        .and_then(|value| value.get("duration"))
+        .and_then(|value| value.as_str())
+        .and_then(|value| value.parse::<f64>().ok());
 
     state.inner.jobs.lock().await.insert(
         job_id.clone(),
         JobEntry {
-            dir,
             input: path,
             stream_count,
+            duration,
         },
     );
 
@@ -129,30 +134,51 @@ pub async fn probe_native_path(
 
 #[tauri::command]
 pub async fn encode_native(
+    app: AppHandle,
     state: State<'_, NativeBackend>,
     job_id: String,
     settings: ConvertSettings,
     tracks: Vec<Track>,
+    output_dir: PathBuf,
+    overwrite: bool,
 ) -> Result<EncodeResponse, String> {
-    let (dir, input, stream_count) = {
+    let (input, stream_count, duration) = {
         let jobs = state.inner.jobs.lock().await;
         let entry = jobs
             .get(&job_id)
             .ok_or_else(|| "Unknown or expired job.".to_owned())?;
-        (entry.dir.clone(), entry.input.clone(), entry.stream_count)
+        (entry.input.clone(), entry.stream_count, entry.duration)
     };
+
+    if !output_dir.is_dir() {
+        return Err("Output folder does not exist.".into());
+    }
 
     core::validate_job(&settings, &tracks, stream_count, &state.inner.encoder_names)?;
     let output_name = format!("{}.{}", core::safe_stem(&settings.output_name), settings.container);
-    let out_dir = dir.join("out");
-    tokio::fs::create_dir_all(&out_dir)
-        .await
-        .map_err(|error| format!("create out dir: {error}"))?;
-    let output = out_dir.join(&output_name);
+    // Write straight into the chosen output folder — no temp files on desktop.
+    let output = output_dir.join(&output_name);
+    if !overwrite && output.exists() {
+        return Ok(EncodeResponse {
+            ok: false,
+            log: format!(
+                "Output file already exists: {output_name}\nEnable \"Overwrite existing files\" to replace it."
+            ),
+            output_name,
+            download_url: String::new(),
+            output_path: None,
+        });
+    }
     let input_str = input.to_string_lossy().into_owned();
     let output_str = output.to_string_lossy().into_owned();
+    // `-progress pipe:1` streams key=value progress on stdout so we can emit a
+    // per-file fraction to the frontend; `-nostats` silences the stderr status
+    // spam while keeping real warnings/errors for the log.
     let mut args = vec![
         "-nostdin".to_owned(),
+        "-progress".to_owned(),
+        "pipe:1".to_owned(),
+        "-nostats".to_owned(),
         "-protocol_whitelist".to_owned(),
         "file,pipe".to_owned(),
     ];
@@ -170,35 +196,52 @@ pub async fn encode_native(
         .acquire()
         .await
         .map_err(|_| "scheduler closed".to_owned())?;
-    let run = tokio::time::timeout(
-        state.inner.job_timeout,
-        tokio::process::Command::new(&state.inner.ffmpeg)
-            .args(&args)
-            .current_dir(&dir)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await;
 
-    let output_result = match run {
-        Err(_) => return Err("Encode timed out.".into()),
-        Ok(Err(error)) => return Err(format!("spawn ffmpeg: {error}")),
-        Ok(Ok(output)) => output,
+    let mut child = tokio::process::Command::new(&state.inner.ffmpeg)
+        .args(&args)
+        .current_dir(&output_dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| format!("spawn ffmpeg: {error}"))?;
+
+    let stdout = child.stdout.take().ok_or("no ffmpeg stdout")?;
+    let stderr = child.stderr.take().ok_or("no ffmpeg stderr")?;
+    let progress = tokio::spawn(pump_progress(stdout, app.clone(), job_id.clone(), duration));
+    let stderr_task = tokio::spawn(async move {
+        let mut buffer = Vec::new();
+        let mut stderr = stderr;
+        let _ = stderr.read_to_end(&mut buffer).await;
+        buffer
+    });
+
+    let status = match tokio::time::timeout(state.inner.job_timeout, child.wait()).await {
+        Err(_) => {
+            let _ = child.kill().await;
+            progress.abort();
+            return Err("Encode timed out.".into());
+        }
+        Ok(Err(error)) => return Err(format!("run ffmpeg: {error}")),
+        Ok(Ok(status)) => status,
     };
-    let log = String::from_utf8_lossy(&output_result.stderr).into_owned();
-    if !output_result.status.success() {
+    let _ = progress.await;
+    let stderr_bytes = stderr_task.await.unwrap_or_default();
+    let log = String::from_utf8_lossy(&stderr_bytes).into_owned();
+
+    if !status.success() {
+        emit_progress(&app, &job_id, 0.0);
         return Ok(EncodeResponse {
             ok: false,
-            log: format!("FFmpeg exited with {}.\n\n{}", output_result.status, tail(&log, 8000)),
+            log: format!("FFmpeg exited with {}.\n\n{}", status, tail(&log, 8000)),
             output_name,
             download_url: String::new(),
             output_path: None,
         });
     }
 
+    emit_progress(&app, &job_id, 1.0);
     Ok(EncodeResponse {
         ok: true,
         log: tail(&log, 8000),
@@ -208,12 +251,37 @@ pub async fn encode_native(
     })
 }
 
-#[tauri::command]
-pub async fn save_output_native(output_path: PathBuf, destination: PathBuf) -> Result<(), String> {
-    tokio::fs::copy(&output_path, &destination)
-        .await
-        .map_err(|error| format!("save output: {error}"))?;
-    Ok(())
+/// Read FFmpeg's `-progress` stream and emit a per-file completion fraction to
+/// the frontend on every progress block.
+async fn pump_progress(
+    stdout: tokio::process::ChildStdout,
+    app: AppHandle,
+    job_id: String,
+    duration: Option<f64>,
+) {
+    let mut lines = BufReader::new(stdout).lines();
+    let mut out_time_us: f64 = 0.0;
+    while let Ok(Some(line)) = lines.next_line().await {
+        if let Some(value) = line.strip_prefix("out_time_us=") {
+            out_time_us = value.trim().parse().unwrap_or(out_time_us);
+        } else if line.starts_with("progress=") {
+            let fraction = match duration {
+                Some(total) if total > 0.0 => (out_time_us / 1_000_000.0 / total).clamp(0.0, 1.0),
+                _ => 0.0,
+            };
+            emit_progress(&app, &job_id, fraction);
+        }
+    }
+}
+
+fn emit_progress(app: &AppHandle, job_id: &str, fraction: f64) {
+    let _ = app.emit(
+        "webcoder-encode-progress",
+        ProgressPayload {
+            job_id: job_id.to_owned(),
+            fraction,
+        },
+    );
 }
 
 async fn probe_encoders(ffmpeg: &str) -> Result<Vec<EncoderInfo>, String> {

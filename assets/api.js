@@ -124,12 +124,14 @@ export async function probeNativePath(path) {
 
 // Runs the encode for a previously-probed job. settingsJson/tracksJson are
 // JSON strings produced by serde on the Rust side; forwarded verbatim.
-export async function runEncode(jobId, settingsJson, tracksJson) {
+export async function runEncode(jobId, settingsJson, tracksJson, outputDir, overwrite) {
   if (isTauri()) {
     return JSON.stringify(await tauriInvoke()("encode_native", {
       jobId,
       settings: JSON.parse(settingsJson),
       tracks: JSON.parse(tracksJson),
+      outputDir,
+      overwrite: Boolean(overwrite),
     }));
   }
   const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/encode`, fetchOptions({
@@ -147,30 +149,25 @@ export function withApiKey(url) {
   return withKey(url);
 }
 
-export async function saveOutput(outputPath, outputName) {
-  if (!isTauri()) return false;
+// Desktop: pick the output folder for a batch run before encoding. Returns the
+// chosen absolute path, or "" if the user cancelled.
+export async function pickOutputDir() {
   const dialog = tauriDialog();
-  if (!dialog || !dialog.save) throw new Error("Save dialog unavailable.");
-  const destination = await dialog.save({ defaultPath: outputName || "output" });
-  if (!destination) return false;
-  await tauriInvoke()("save_output_native", { outputPath, destination });
-  return true;
+  if (!dialog || !dialog.open) return "";
+  const dir = await dialog.open({ directory: true, multiple: false });
+  return dir || "";
 }
 
-// Pick one destination folder, then copy every finished output into it.
-// `itemsJson` is a JSON array of { output_path, output_name }.
-export async function saveAllOutputs(itemsJson) {
-  if (!isTauri()) return JSON.stringify({ saved: 0 });
-  const dialog = tauriDialog();
-  if (!dialog || !dialog.open) throw new Error("Folder dialog unavailable.");
-  const dir = await dialog.open({ directory: true, multiple: false });
-  if (!dir) return JSON.stringify({ saved: 0 });
-  const items = JSON.parse(itemsJson);
-  let saved = 0;
-  for (const item of items) {
-    const destination = `${dir}/${item.output_name}`;
-    await tauriInvoke()("save_output_native", { outputPath: item.output_path, destination });
-    saved += 1;
-  }
-  return JSON.stringify({ saved });
+// Desktop: subscribe to per-file encode progress. `callback(jobId, fraction)`
+// fires as FFmpeg reports progress (fraction in 0..1). No-op outside Tauri.
+export function listenEncodeProgress(callback) {
+  if (!isTauri()) return;
+  const event = window.__TAURI__ && window.__TAURI__.event;
+  if (!event || !event.listen) return;
+  event.listen("webcoder-encode-progress", (e) => {
+    const payload = e && e.payload;
+    if (payload && typeof payload.job_id === "string") {
+      callback(payload.job_id, payload.fraction || 0);
+    }
+  });
 }

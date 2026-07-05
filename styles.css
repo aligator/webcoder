@@ -927,6 +927,74 @@ button:focus-visible {
   padding: 12px 0;
 }
 
+.progress-track {
+  height: 6px;
+  width: 100%;
+  border-radius: 999px;
+  background: var(--surface-2);
+  overflow: hidden;
+}
+
+.progress-bar {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 999px;
+  transition: width 0.2s ease;
+}
+
+.progress-bar.indeterminate {
+  width: 40% !important;
+  animation: progress-slide 1.1s ease-in-out infinite;
+}
+
+@keyframes progress-slide {
+  0% { margin-left: -40%; }
+  100% { margin-left: 100%; }
+}
+
+.output-folder {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.output-folder .field-label {
+  color: var(--muted);
+  font-size: 0.85rem;
+  white-space: nowrap;
+}
+
+.output-folder-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.85rem;
+  font-family: ui-monospace, monospace;
+  color: var(--ink);
+}
+
+.output-folder-path.is-empty {
+  color: var(--muted);
+  font-family: inherit;
+  font-style: italic;
+}
+
+.overwrite-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 0.85rem;
+  user-select: none;
+  cursor: pointer;
+}
+
+.overwrite-toggle input {
+  accent-color: var(--accent);
+}
+
 .runtime-actions {
   display: flex;
   align-items: center;
