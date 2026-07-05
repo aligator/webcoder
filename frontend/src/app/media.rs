@@ -5,14 +5,14 @@
 //! row only re-renders when its own file/track changes.
 
 use wasm_bindgen_futures::spawn_local;
-use web_sys::{DragEvent, Event, HtmlInputElement, HtmlSelectElement, InputEvent};
+use web_sys::{Event, HtmlInputElement, HtmlSelectElement, InputEvent};
 use yew::TargetCast;
 use yew::prelude::*;
 
 use crate::core::{MediaFile, StreamKind, Track, TrackOutput, format_size};
 
-use super::bridge::{js_error_text, native_app, parse_json, pick_native_files};
-use super::ingest::{JobIds, ingest_native_paths, ingest_web_files};
+use super::bridge::{js_error_text, parse_json, pick_native_files};
+use super::ingest::{JobIds, ingest_native_paths};
 use super::state::{AppAction, AppCtx, TrackPatch};
 use super::types::BrowserEncoder;
 use super::widgets::{empty_panel, icon, noop_select, option_selected};
@@ -35,54 +35,13 @@ pub(crate) struct MediaTabProps {
 #[function_component(MediaTab)]
 pub(crate) fn media_tab(props: &MediaTabProps) -> Html {
     let state = use_context::<AppCtx>().expect("AppCtx not found");
-    // Screen-size column toggle and drag hover are pure view state, so they
-    // stay local instead of in the shared store.
+    // Screen-size column toggle is pure view state, so it stays local instead
+    // of in the shared store.
     let media_col = use_state(|| MediaCol::Tracks);
-    let dragging = use_state(|| false);
 
-    let is_native = native_app();
     let job_ids = &props.job_ids;
     let job_log = &props.job_log;
 
-    let on_files = {
-        let state = state.clone();
-        let job_ids = job_ids.clone();
-        let job_log = job_log.clone();
-        Callback::from(move |event: Event| {
-            let input: HtmlInputElement = event.target_unchecked_into();
-            if let Some(files) = input.files() {
-                ingest_web_files(files, state.clone(), job_ids.clone(), job_log.clone());
-            }
-        })
-    };
-    let on_drop = {
-        let state = state.clone();
-        let job_ids = job_ids.clone();
-        let job_log = job_log.clone();
-        let dragging = dragging.clone();
-        Callback::from(move |event: DragEvent| {
-            event.prevent_default();
-            dragging.set(false);
-            if let Some(files) = event.data_transfer().and_then(|dt| dt.files()) {
-                ingest_web_files(files, state.clone(), job_ids.clone(), job_log.clone());
-            }
-        })
-    };
-    let on_drag_over = Callback::from(|event: DragEvent| event.prevent_default());
-    let on_drag_enter = {
-        let dragging = dragging.clone();
-        Callback::from(move |event: DragEvent| {
-            event.prevent_default();
-            dragging.set(true);
-        })
-    };
-    let on_drag_leave = {
-        let dragging = dragging.clone();
-        Callback::from(move |event: DragEvent| {
-            event.prevent_default();
-            dragging.set(false);
-        })
-    };
     let on_native_files = {
         let state = state.clone();
         let job_ids = job_ids.clone();
@@ -132,42 +91,14 @@ pub(crate) fn media_tab(props: &MediaTabProps) -> Html {
                 { view_tracks(&state, &props.encoders) }
             </div>
             <aside class="media-files">
-                <section
-                    class={classes!("drop-zone", dragging.then_some("dragging"))}
-                    ondragover={on_drag_over}
-                    ondragenter={on_drag_enter}
-                    ondragleave={on_drag_leave}
-                    ondrop={on_drop}
-                >
+                <section class="drop-zone">
                     <span class="drop-icon material-symbols-rounded">{"cloud_upload"}</span>
                     <strong>{"Drop media here"}</strong>
-                    <small>{
-                        if is_native {
-                            "Drag files in, or browse your disk."
-                        } else {
-                            "Drag files in, or browse to upload & probe."
-                        }
-                    }</small>
-                    {
-                        if is_native {
-                            html! {
-                                <button class="command-button accent drop-cta" type="button" onclick={on_native_files}>
-                                    { icon("folder_open") }
-                                    { "Browse files" }
-                                </button>
-                            }
-                        } else {
-                            html! {
-                                <>
-                                    <input id="file-picker" class="visually-hidden" type="file" multiple=true onchange={on_files} />
-                                    <label class="command-button accent drop-cta" for="file-picker">
-                                        { icon("folder_open") }
-                                        { "Browse files" }
-                                    </label>
-                                </>
-                            }
-                        }
-                    }
+                    <small>{"Drag files in, or browse your disk."}</small>
+                    <button class="command-button accent drop-cta" type="button" onclick={on_native_files}>
+                        { icon("folder_open") }
+                        { "Browse files" }
+                    </button>
                 </section>
 
                 <div class="file-toolbar">

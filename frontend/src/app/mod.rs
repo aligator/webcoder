@@ -8,7 +8,7 @@
 //! - [`bridge`] — the `assets/api.js` FFI plus JSON decode helpers.
 //! - [`types`] — bridge response shapes and the navigation enum.
 //! - [`widgets`] — small reusable form fields and presentational helpers.
-//! - [`ingest`] — uploading/probing browser files and native paths.
+//! - [`ingest`] — probing native file paths with the backend FFmpeg.
 //! - [`side_rail`], [`command_preview`] — the rail and preview pane.
 //! - [`media`], [`convert`], [`queue`] — the three tab views.
 
@@ -72,7 +72,7 @@ pub fn app() -> Html {
         });
     }
     let show_command_preview = use_state(|| false);
-    let job_log = use_state(|| "Server FFmpeg runtime idle.".to_owned());
+    let job_log = use_state(|| "FFmpeg runtime idle.".to_owned());
     let browser_encoders = use_state(Vec::<BrowserEncoder>::new);
     // Maps a local file id to the server-side job id returned by the probe
     // upload, so the encode request can reference the already-uploaded input.
@@ -85,8 +85,8 @@ pub fn app() -> Html {
     let latest_state = use_mut_ref(AppState::default);
     *latest_state.borrow_mut() = (*state).clone();
 
-    // Register the desktop (Tauri) OS drag-drop listener once. Browser DnD is
-    // handled by the drop zone's own DragEvent handlers.
+    // Register the Tauri OS drag-drop listener once. The webview swallows HTML5
+    // DnD, so OS drops arrive here as a forwarded app event carrying paths.
     {
         let state = state.clone();
         let job_ids = job_ids.clone();
@@ -106,7 +106,7 @@ pub fn app() -> Html {
         });
     }
 
-    // Fetch the encoders the server's FFmpeg supports once on load so every
+    // Fetch the encoders the backend FFmpeg supports once on load so every
     // output dropdown lists only codecs the backend can actually run.
     {
         let browser_encoders = browser_encoders.clone();

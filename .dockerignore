@@ -1,8 +1,0 @@
-target/
-dist/
-.git/
-.github/
-.gitignore
-Dockerfile
-.dockerignore
-*.md

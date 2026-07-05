@@ -1,27 +1,24 @@
 # Webcoder
 
-A self-hosted and desktop media transcoder powered by [FFmpeg](https://ffmpeg.org/).
+A desktop media transcoder powered by [FFmpeg](https://ffmpeg.org/).
 Pick codecs, quality and filters in the UI; encoding runs natively so the full
 codec set is available (AV1, HEVC, …).
 
 > Inspired by [**Nmkoder** by n00mkrad](https://github.com/n00mkrad/nmkoder).
 
-`webcoder` is one binary with two modes:
-
-- **desktop** (default) — Tauri app with a native file picker.
-- **`--headless`** — HTTP server for Docker/self-hosting.
+Webcoder is a [Tauri](https://tauri.app/) app: a Yew/WASM UI in a native
+window, driving the system `ffmpeg`/`ffprobe` through Tauri commands. Files are
+added via the native picker or OS drag-and-drop and encoded straight into the
+output folder you choose.
 
 ## Run
 
 ```sh
-# Desktop / development
+# Development
 cargo tauri-dev
 
-# Headless server → http://localhost:8080
-cargo headless
-
-# Docker
-docker run --rm -p 8080:8080 -e WEBCODER_AUTH=me:secret ghcr.io/aligator/webcoder
+# Release bundle (AppImage/deb/…)
+cargo tauri-build
 
 # Flatpak (bundles its own FFmpeg)
 flatpak-builder --force-clean --user --install build-dir flatpak/dev.webcoder.app.yml
@@ -31,11 +28,8 @@ flatpak run dev.webcoder.app
 Requires the Rust toolchain, [Trunk](https://trunkrs.dev/) and `ffmpeg` on
 `PATH` (except Flatpak, which bundles FFmpeg).
 
-## Configuration
-
-Headless mode reads environment variables — notably `WEBCODER_ADDR`
-(default `127.0.0.1:8080`) and `WEBCODER_AUTH=user:pass` for HTTP Basic auth.
-See [`src-tauri/src/server.rs`](src-tauri/src/server.rs) for the full list.
+`WEBCODER_FFMPEG` / `WEBCODER_FFPROBE` override the binary paths if the tools
+are not on `PATH` (the Flatpak launcher sets these to the bundled build).
 
 ## License
 

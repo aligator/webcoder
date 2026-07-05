@@ -6,7 +6,7 @@
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>GPL-3.0-or-later</project_license>
   <description>
-    <p>Webcoder is a desktop and self-hosted media transcoder UI backed by FFmpeg.</p>
+    <p>Webcoder is a desktop media transcoder UI backed by FFmpeg.</p>
   </description>
   <launchable type="desktop-id">dev.webcoder.app.desktop</launchable>
   <provides>

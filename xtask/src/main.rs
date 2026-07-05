@@ -10,7 +10,6 @@ fn main() -> ExitCode {
     let status = match task.as_str() {
         "tauri-dev" => cargo_tauri("dev", args),
         "tauri-build" => cargo_tauri("build", args),
-        "headless" => headless(args),
         _ => {
             eprintln!("unknown task: {task}");
             return ExitCode::from(2);
@@ -32,26 +31,4 @@ fn cargo_tauri(command: &str, args: impl Iterator<Item = String>) -> std::proces
         .current_dir("src-tauri")
         .status()
         .expect("run cargo tauri")
-}
-
-fn headless(args: impl Iterator<Item = String>) -> std::process::ExitStatus {
-    let frontend = Command::new("trunk")
-        .arg("build")
-        .status()
-        .expect("run trunk build");
-    if !frontend.success() {
-        return frontend;
-    }
-
-    Command::new("cargo")
-        .arg("run")
-        .arg("-p")
-        .arg("webcoder-desktop")
-        .arg("--bin")
-        .arg("webcoder")
-        .arg("--")
-        .arg("--headless")
-        .args(args)
-        .status()
-        .expect("run webcoder headless")
 }

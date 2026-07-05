@@ -1,9 +1,9 @@
-//! The Queue tab: the batch-run board, the server runtime panel, and the
-//! per-input result cards (download / save / zip-all wiring).
+//! The Queue tab: the batch-run board, the FFmpeg runtime panel, and the
+//! per-input result cards (output folder / overwrite wiring).
 //!
 //! The batch results are this tab's own concern, so they live in local state;
 //! the tab reaches into the shared store only for the file list and settings,
-//! and reports save-all outcomes back up through the `on_toast` callback.
+//! and reports outcomes back up through the `on_toast` callback.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -14,8 +14,7 @@ use wasm_bindgen_futures::spawn_local;
 use yew::prelude::*;
 
 use super::bridge::{
-    js_error_text, listen_encode_progress, native_app, parse_json, pick_output_dir, run_encode,
-    with_api_key,
+    js_error_text, listen_encode_progress, parse_json, pick_output_dir, run_encode,
 };
 use super::ingest::JobIds;
 use super::state::AppCtx;
@@ -65,7 +64,6 @@ pub(crate) fn queue_tab(props: &QueueTabProps) -> Html {
     let tick = use_state(|| 0u32);
     let tick_counter = use_mut_ref(|| 0u32);
 
-    let is_native = native_app();
     let job_ids = &props.job_ids;
     let ready = state
         .files
@@ -160,9 +158,9 @@ pub(crate) fn queue_tab(props: &QueueTabProps) -> Html {
                 return;
             }
 
-            // Desktop uses the remembered output folder; abort if none chosen.
-            let output_dir = if is_native { (*output_dir).clone() } else { String::new() };
-            if is_native && output_dir.is_empty() {
+            // Encodes write into the remembered output folder; abort if none chosen.
+            let output_dir = (*output_dir).clone();
+            if output_dir.is_empty() {
                 on_toast.emit("Choose an output folder first.".to_owned());
                 return;
             }
@@ -179,9 +177,7 @@ pub(crate) fn queue_tab(props: &QueueTabProps) -> Html {
                         job_id: job_id.clone(),
                         status: EncodeStatus::Running,
                         log: String::new(),
-                        download_url: String::new(),
                         output_path: String::new(),
-                        output_name: String::new(),
                     })
                     .collect();
                 results.set(items.clone());
@@ -205,8 +201,6 @@ pub(crate) fn queue_tab(props: &QueueTabProps) -> Html {
                                     EncodeStatus::Failed
                                 };
                                 items[index].log = response.log;
-                                items[index].output_name = response.output_name;
-                                items[index].download_url = response.download_url;
                                 items[index].output_path = response.output_path.unwrap_or_default();
                             }
                             Err(error) => {
@@ -217,7 +211,7 @@ pub(crate) fn queue_tab(props: &QueueTabProps) -> Html {
                         Err(error) => {
                             items[index].status = EncodeStatus::Failed;
                             items[index].log =
-                                format!("Server encode failed: {}", js_error_text(error));
+                                format!("Encode failed: {}", js_error_text(error));
                         }
                     }
                     results.set(items.clone());
@@ -248,72 +242,50 @@ pub(crate) fn queue_tab(props: &QueueTabProps) -> Html {
             </section>
             <section class="settings-group wide runtime-panel">
                 <div class="panel-title">
-                    <div class="panel-title-label">{ icon("play_circle") }<h2>{"Server Runtime"}</h2></div>
-                    {{
-                        let done_ids: Vec<String> = results
-                            .iter()
-                            .filter(|r| r.status == EncodeStatus::Done)
-                            .map(|r| r.job_id.clone())
-                            .collect();
+                    <div class="panel-title-label">{ icon("play_circle") }<h2>{"FFmpeg Runtime"}</h2></div>
+                    {
                         if results.is_empty() {
                             Html::default()
                         } else {
-                            // Browser: zip-download every finished output. Desktop
-                            // writes straight into the chosen folder, so no action.
-                            let zip_link = if done_ids.len() > 1 && !is_native {
-                                let href = with_api_key(&format!("/api/zip?jobs={}", done_ids.join(",")));
-                                html! {
-                                    <a class="command-button accent result-download" href={href} download="webcoder-batch.zip">
-                                        { icon("folder_zip") }
-                                        { "Download all" }
-                                    </a>
-                                }
-                            } else {
-                                Html::default()
-                            };
+                            let done = results.iter().filter(|r| r.status == EncodeStatus::Done).count();
                             html! {
                                 <div class="runtime-actions">
-                                    <span class="result-status">{ format!("{}/{} done", done_ids.len(), results.len()) }</span>
-                                    { zip_link }
+                                    <span class="result-status">{ format!("{}/{} done", done, results.len()) }</span>
                                 </div>
                             }
                         }
-                    }}
-                </div>
-                {
-                    if is_native {
-                        let toggle = {
-                            let overwrite = overwrite.clone();
-                            Callback::from(move |_| {
-                                let next = !*overwrite;
-                                ls_set(LS_OVERWRITE, if next { "1" } else { "0" });
-                                overwrite.set(next);
-                            })
-                        };
-                        let dir_empty = output_dir.is_empty();
-                        html! {
-                            <>
-                                <div class="output-folder">
-                                    <span class="field-label">{ "Output folder" }</span>
-                                    <span class={classes!("output-folder-path", dir_empty.then_some("is-empty"))}>
-                                        { if dir_empty { "No folder selected".to_owned() } else { (*output_dir).clone() } }
-                                    </span>
-                                    <button class="command-button result-download" type="button" onclick={choose_folder}>
-                                        { icon("folder") }
-                                        { "Choose…" }
-                                    </button>
-                                </div>
-                                <label class="overwrite-toggle">
-                                    <input type="checkbox" checked={*overwrite} onchange={toggle} />
-                                    { "Overwrite existing files" }
-                                </label>
-                            </>
-                        }
-                    } else {
-                        Html::default()
                     }
-                }
-                <button class="command-button accent" onclick={run_batch} disabled={ready == 0 || (is_native && output_dir.is_empty())}>
+                </div>
+                {{
+                    let toggle = {
+                        let overwrite = overwrite.clone();
+                        Callback::from(move |_| {
+                            let next = !*overwrite;
+                            ls_set(LS_OVERWRITE, if next { "1" } else { "0" });
+                            overwrite.set(next);
+                        })
+                    };
+                    let dir_empty = output_dir.is_empty();
+                    html! {
+                        <>
+                            <div class="output-folder">
+                                <span class="field-label">{ "Output folder" }</span>
+                                <span class={classes!("output-folder-path", dir_empty.then_some("is-empty"))}>
+                                    { if dir_empty { "No folder selected".to_owned() } else { (*output_dir).clone() } }
+                                </span>
+                                <button class="command-button result-download" type="button" onclick={choose_folder}>
+                                    { icon("folder") }
+                                    { "Choose…" }
+                                </button>
+                            </div>
+                            <label class="overwrite-toggle">
+                                <input type="checkbox" checked={*overwrite} onchange={toggle} />
+                                { "Overwrite existing files" }
+                            </label>
+                        </>
+                    }
+                }}
+                <button class="command-button accent" onclick={run_batch} disabled={ready == 0 || output_dir.is_empty()}>
                     { format!("RUN ({ready})") }
                 </button>
                 <div class="results-list">
@@ -365,15 +337,10 @@ fn result_row(props: &ResultRowProps) -> Html {
                 <strong>{&item.name}</strong>
                 <span class="result-status">{label}</span>
                 {
-                    // Browser: offer a download link. Desktop writes the file
-                    // straight into the chosen output folder, so no button.
-                    if !item.download_url.is_empty() {
-                        html! {
-                            <a class="command-button accent result-download" href={item.download_url.clone()} download={item.output_name.clone()}>
-                                { icon("download") }
-                                { "Download" }
-                            </a>
-                        }
+                    // Encodes write straight into the chosen output folder; show
+                    // the saved path once a file has been produced.
+                    if !item.output_path.is_empty() {
+                        html! { <span class="result-path" title={item.output_path.clone()}>{&item.output_path}</span> }
                     } else {
                         Html::default()
                     }

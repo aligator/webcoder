@@ -26,8 +26,6 @@ pub(crate) struct ProbeResponse {
 pub(crate) struct EncodeResponse {
     pub(crate) ok: bool,
     pub(crate) log: String,
-    pub(crate) output_name: String,
-    pub(crate) download_url: String,
     pub(crate) output_path: Option<String>,
 }
 
@@ -45,9 +43,7 @@ pub(crate) struct EncodeItem {
     pub(crate) job_id: String,
     pub(crate) status: EncodeStatus,
     pub(crate) log: String,
-    pub(crate) download_url: String,
     pub(crate) output_path: String,
-    pub(crate) output_name: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -76,12 +72,12 @@ impl Tab {
         match self {
             Self::Media => "Add files and set per-stream copy, strip, or transcode.",
             Self::Convert => "Tune container, codecs, quality, resize, crop, and audio settings.",
-            Self::Queue => "Batch-encode every input on the server with native FFmpeg.",
+            Self::Queue => "Batch-encode every input with native FFmpeg.",
         }
     }
 }
 
-/// One encoder offered by the server's FFmpeg, from `ffmpeg -encoders`. Drives
+/// One encoder offered by the backend FFmpeg, from `ffmpeg -encoders`. Drives
 /// the per-track output dropdown so it lists only codecs the backend can run.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct BrowserEncoder {

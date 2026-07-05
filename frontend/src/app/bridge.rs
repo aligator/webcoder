@@ -4,24 +4,17 @@
 use serde::Deserialize;
 use wasm_bindgen::JsValue;
 use wasm_bindgen::prelude::*;
-use web_sys::File;
 
 #[wasm_bindgen(module = "/assets/api.js")]
 extern "C" {
     #[wasm_bindgen(catch, js_name = getEncoders)]
     pub(crate) async fn get_encoders() -> Result<JsValue, JsValue>;
 
-    #[wasm_bindgen(catch, js_name = probeMedia)]
-    pub(crate) async fn probe_media(file: File) -> Result<JsValue, JsValue>;
-
     #[wasm_bindgen(catch, js_name = pickNativeFiles)]
     pub(crate) async fn pick_native_files() -> Result<JsValue, JsValue>;
 
     #[wasm_bindgen(catch, js_name = probeNativePath)]
     pub(crate) async fn probe_native_path(path: String) -> Result<JsValue, JsValue>;
-
-    #[wasm_bindgen(js_name = nativeApp)]
-    pub(crate) fn native_app() -> bool;
 
     #[wasm_bindgen(js_name = listenNativeDrop)]
     pub(crate) fn listen_native_drop(callback: &JsValue);
@@ -34,9 +27,6 @@ extern "C" {
         output_dir: String,
         overwrite: bool,
     ) -> Result<JsValue, JsValue>;
-
-    #[wasm_bindgen(js_name = withApiKey)]
-    pub(crate) fn with_api_key(url: &str) -> String;
 
     #[wasm_bindgen(catch, js_name = pickOutputDir)]
     pub(crate) async fn pick_output_dir() -> Result<JsValue, JsValue>;

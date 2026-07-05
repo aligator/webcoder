@@ -58,8 +58,6 @@ pub struct ProbeResponse {
 pub struct EncodeResponse {
     ok: bool,
     log: String,
-    output_name: String,
-    download_url: String,
     output_path: Option<String>,
 }
 
@@ -164,8 +162,6 @@ pub async fn encode_native(
             log: format!(
                 "Output file already exists: {output_name}\nEnable \"Overwrite existing files\" to replace it."
             ),
-            output_name,
-            download_url: String::new(),
             output_path: None,
         });
     }
@@ -235,8 +231,6 @@ pub async fn encode_native(
         return Ok(EncodeResponse {
             ok: false,
             log: format!("FFmpeg exited with {}.\n\n{}", status, tail(&log, 8000)),
-            output_name,
-            download_url: String::new(),
             output_path: None,
         });
     }
@@ -245,8 +239,6 @@ pub async fn encode_native(
     Ok(EncodeResponse {
         ok: true,
         log: tail(&log, 8000),
-        output_name,
-        download_url: String::new(),
         output_path: Some(output.to_string_lossy().into_owned()),
     })
 }
