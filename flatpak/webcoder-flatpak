@@ -1,4 +1,9 @@
 #!/bin/sh
+# WebKitGTK's DMABUF renderer triggers a Wayland protocol error (Gdk Error 71)
+# and/or a blank window on NVIDIA drivers. Disabling it forces a compatible
+# path at the cost of the faster renderer. This is the standard Tauri/webkit2gtk
+# workaround for NVIDIA + Wayland setups.
+export WEBKIT_DISABLE_DMABUF_RENDERER=1
 export WEBCODER_DESKTOP_DIST=/app/share/webcoder/dist
 export WEBCODER_FFMPEG=/app/bin/ffmpeg
 export WEBCODER_FFPROBE=/app/bin/ffprobe
