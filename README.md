@@ -24,8 +24,8 @@ cargo headless
 docker run --rm -p 8080:8080 -e WEBCODER_AUTH=me:secret ghcr.io/aligator/webcoder
 
 # Flatpak (bundles its own FFmpeg)
-flatpak-builder --force-clean --user --install build-dir flatpak/dev.aligator.webcoder.yml
-flatpak run dev.aligator.webcoder
+flatpak-builder --force-clean --user --install build-dir flatpak/dev.webcoder.app.yml
+flatpak run dev.webcoder.app
 ```
 
 Requires the Rust toolchain, [Trunk](https://trunkrs.dev/) and `ffmpeg` on
