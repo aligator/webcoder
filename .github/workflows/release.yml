@@ -41,6 +41,13 @@ jobs:
           cargo install trunk --locked
           cargo install tauri-cli --version "^2" --locked
 
+      - name: Set version from tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "Bundling version $VERSION"
+          jq --arg v "$VERSION" '.version = $v' src-tauri/tauri.conf.json > tauri.conf.tmp
+          mv tauri.conf.tmp src-tauri/tauri.conf.json
+
       - name: Build Tauri desktop
         run: cargo tauri-build
 
