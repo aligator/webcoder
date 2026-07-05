@@ -103,7 +103,7 @@ jobs:
       - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
         with:
           bundle: webcoder.flatpak
-          manifest-path: flatpak/dev.webcoder.app.yml
+          manifest-path: flatpak/dev.aligator.webcoder.yml
           cache-key: flatpak-builder-${{ github.sha }}
           verbose: true
 

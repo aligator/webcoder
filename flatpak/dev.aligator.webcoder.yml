@@ -1,4 +1,4 @@
-app-id: dev.webcoder.app
+app-id: dev.aligator.webcoder
 runtime: org.gnome.Platform
 runtime-version: "50"
 sdk: org.gnome.Sdk
@@ -103,10 +103,10 @@ modules:
       - install -Dm755 flatpak/webcoder-flatpak /app/bin/webcoder-flatpak
       - install -d /app/share/webcoder/dist
       - cp -r dist/. /app/share/webcoder/dist/
-      - install -Dm644 flatpak/dev.webcoder.app.desktop /app/share/applications/dev.webcoder.app.desktop
-      - install -Dm644 flatpak/dev.webcoder.app.metainfo.xml /app/share/metainfo/dev.webcoder.app.metainfo.xml
-      - install -Dm644 src-tauri/icons/icon.png /app/share/icons/hicolor/32x32/apps/dev.webcoder.app.png
-      - install -Dm644 src-tauri/icons/128x128.png /app/share/icons/hicolor/128x128/apps/dev.webcoder.app.png
+      - install -Dm644 flatpak/dev.aligator.webcoder.desktop /app/share/applications/dev.aligator.webcoder.desktop
+      - install -Dm644 flatpak/dev.aligator.webcoder.metainfo.xml /app/share/metainfo/dev.aligator.webcoder.metainfo.xml
+      - install -Dm644 src-tauri/icons/icon.png /app/share/icons/hicolor/32x32/apps/dev.aligator.webcoder.png
+      - install -Dm644 src-tauri/icons/128x128.png /app/share/icons/hicolor/128x128/apps/dev.aligator.webcoder.png
     sources:
       - type: dir
         path: ..

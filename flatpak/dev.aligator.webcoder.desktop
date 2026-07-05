@@ -3,6 +3,6 @@ Type=Application
 Name=Webcoder
 Comment=Local FFmpeg transcoder frontend
 Exec=webcoder-flatpak
-Icon=dev.webcoder.app
+Icon=dev.aligator.webcoder
 Terminal=false
 Categories=AudioVideo;Video;Utility;

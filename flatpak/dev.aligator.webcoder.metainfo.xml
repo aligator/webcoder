@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>dev.webcoder.app</id>
+  <id>dev.aligator.webcoder</id>
   <name>Webcoder</name>
   <summary>Local FFmpeg transcoder frontend</summary>
   <metadata_license>CC0-1.0</metadata_license>
@@ -8,7 +8,7 @@
   <description>
     <p>Webcoder is a desktop and self-hosted media transcoder UI backed by FFmpeg.</p>
   </description>
-  <launchable type="desktop-id">dev.webcoder.app.desktop</launchable>
+  <launchable type="desktop-id">dev.aligator.webcoder.desktop</launchable>
   <provides>
     <binary>webcoder-flatpak</binary>
   </provides>
