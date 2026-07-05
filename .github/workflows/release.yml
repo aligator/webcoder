@@ -47,7 +47,10 @@ jobs:
       - name: Upload Tauri bundles to release
         uses: softprops/action-gh-release@v2
         with:
-          files: target/release/bundle/**/*
+          files: |
+            target/release/bundle/appimage/*.AppImage
+            target/release/bundle/deb/*.deb
+            target/release/bundle/rpm/*.rpm
 
   flatpak:
     name: build Flatpak bundle
